@@ -754,7 +754,7 @@ async function callConnectRpc(baseUrl, rpcPath, requestBody) {
       port: url.port || 443,
       path: url.pathname,
       headers: {
-        "Content-Type": "application/connect+proto",
+        "Content-Type": "application/grpc",
         "Connect-Protocol-Version": "1",
         "Accept-Encoding": "identity",
         "User-Agent": "connect-es/2.0.0-rc.3",
