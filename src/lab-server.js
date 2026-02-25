@@ -1263,6 +1263,10 @@ const server = http.createServer(async (req, res) => {
           upstreamHeaders[k] = v;
         }
         upstreamHeaders["host"] = "server.self-serve.windsurf.com";
+        // Windsurf requires application/grpc (rejects connect+proto with 415)
+        if (upstreamHeaders["content-type"]) {
+          upstreamHeaders["content-type"] = upstreamHeaders["content-type"].replace("application/connect+proto", "application/grpc");
+        }
         if (jwtToken) {
           upstreamHeaders["authorization"] = `Bearer ${jwtToken}`;
         } else if (apiKey) {

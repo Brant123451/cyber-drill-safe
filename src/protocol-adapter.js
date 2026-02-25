@@ -159,15 +159,16 @@ class CodeiumAdapter extends BaseAdapter {
     const meta = new ProtoWriter();
     meta.writeStringField(1, "windsurf");
     meta.writeStringField(2, session.editorVersion || "1.48.2");
-    meta.writeStringField(3, session.sessionToken); // api_key (sk-ws-01-...)
+    meta.writeStringField(3, session.sessionToken); // api_key (gsk-ws-01-...)
     meta.writeStringField(4, session.locale || "en");
     meta.writeStringField(5, session.osInfo || "windows");
     meta.writeStringField(7, session.lsVersion || "1.9544.28");
     meta.writeVarintField(9, this._requestCounter);
     meta.writeStringField(10, session.machineId || crypto.randomUUID());
     meta.writeStringField(12, "windsurf");
-    if (session.jwtToken) {
-      meta.writeStringField(21, session.jwtToken);
+    const jwt = session.jwtToken || session.extra?.firebaseIdToken;
+    if (jwt) {
+      meta.writeStringField(21, jwt);
     }
     return meta;
   }
@@ -221,7 +222,7 @@ class CodeiumAdapter extends BaseAdapter {
       url: `${this.apiBase}${this.chatEndpoint}`,
       method: "POST",
       headers: {
-        "Content-Type": "application/connect+proto",
+        "Content-Type": "application/grpc",
         "Connect-Protocol-Version": "1",
         "Connect-Content-Encoding": "gzip",
         "Connect-Accept-Encoding": "gzip",
@@ -296,7 +297,8 @@ class CodeiumAdapter extends BaseAdapter {
       url: `${this.apiBase}${this.pingEndpoint}`,
       method: "POST",
       headers: {
-        "Content-Type": "application/proto",
+        "Content-Type": "application/grpc",
+        "Connect-Protocol-Version": "1",
         "User-Agent": "connect-go/1.18.1 (go1.25.5)",
       },
       body,
