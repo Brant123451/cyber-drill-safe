@@ -4,7 +4,9 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "./session-manager.js";
+import https from "node:https";
 import { getAdapter, sendAdapterRequest, sendAdapterStreamRequest } from "./protocol-adapter.js";
+import { replaceConnectCredentials } from "./connect-proto.js";
 import { UserManager } from "./user-manager.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -84,7 +86,12 @@ try { userManager.load(); } catch (e) {
   console.log(`[lab] user manager init error: ${e.message}`);
 }
 
-let ACCOUNT_POOL = loadAccountPoolFromFile(ACCOUNT_POOL_FILE);
+let ACCOUNT_POOL = [];
+try {
+  ACCOUNT_POOL = loadAccountPoolFromFile(ACCOUNT_POOL_FILE);
+} catch (e) {
+  console.log(`[lab] account pool not loaded: ${e.message} (using session manager only)`);
+}
 
 // ---- Session Manager (平台会话池) ----
 const sessionManager = new SessionManager({
@@ -1216,6 +1223,124 @@ const server = http.createServer(async (req, res) => {
     });
 
     return sendJson(res, 200, payload);
+  }
+
+  // ---- Raw Connect Protocol Proxy (Windsurf MITM) ----
+  // Catches all /exa.* paths forwarded by local-proxy in gateway mode.
+  // Picks a session, replaces credentials, forwards to real Windsurf.
+  if (req.method === "POST" && reqUrl.pathname.startsWith("/exa.")) {
+    const bodyChunks = [];
+    req.on("data", (c) => bodyChunks.push(c));
+    req.on("end", async () => {
+      const body = Buffer.concat(bodyChunks);
+      const startTime = Date.now();
+
+      // Pick a session from the pool
+      const session = sessionManager.pickSession();
+      if (!session) {
+        recordEvent({
+          timestamp: new Date().toISOString(),
+          method: req.method,
+          path: reqUrl.pathname,
+          ip: clientIp,
+          status: 503,
+          reason: "no_available_session",
+          mode: "windsurf_proxy",
+        });
+        return sendJson(res, 503, { error: { message: "no available session in pool" } });
+      }
+
+      try {
+        // Replace credentials in the Connect frame
+        const apiKey = session.sessionToken || session.extra?.apiKey;
+        const jwtToken = session.extra?.jwtToken || session.extra?.firebaseIdToken || null;
+        const modifiedBody = replaceConnectCredentials(body, apiKey, jwtToken);
+
+        // Build upstream headers (forward most headers, swap auth)
+        const upstreamHeaders = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (k === "host" || k === "x-original-host" || k === "x-intercepted-by" || k === "connection") continue;
+          upstreamHeaders[k] = v;
+        }
+        upstreamHeaders["host"] = "server.self-serve.windsurf.com";
+        if (jwtToken) {
+          upstreamHeaders["authorization"] = `Bearer ${jwtToken}`;
+        } else if (apiKey) {
+          upstreamHeaders["authorization"] = `Bearer ${apiKey}`;
+        }
+
+        // Forward to real Windsurf
+        const upstreamReq = https.request({
+          hostname: "server.self-serve.windsurf.com",
+          port: 443,
+          path: reqUrl.pathname,
+          method: "POST",
+          headers: upstreamHeaders,
+          timeout: UPSTREAM_TIMEOUT_MS,
+        }, (upstreamRes) => {
+          const resChunks = [];
+          upstreamRes.on("data", (c) => resChunks.push(c));
+          upstreamRes.on("end", () => {
+            const resBody = Buffer.concat(resChunks);
+            const durationMs = Date.now() - startTime;
+
+            console.log(`[windsurf-proxy] ${reqUrl.pathname} -> ${upstreamRes.statusCode} (${durationMs}ms, session=${session.id})`);
+
+            // Estimate token usage for accounting
+            const tokenEstimate = Math.max(1, Math.ceil(body.length / 50));
+            sessionManager.recordUsage(session.id, tokenEstimate);
+
+            recordEvent({
+              timestamp: new Date().toISOString(),
+              method: req.method,
+              path: reqUrl.pathname,
+              ip: clientIp,
+              status: upstreamRes.statusCode,
+              sessionId: session.id,
+              mode: "windsurf_proxy",
+              durationMs,
+            });
+
+            // Forward response headers and body
+            const resHeaders = {};
+            for (const [k, v] of Object.entries(upstreamRes.headers)) {
+              if (k === "transfer-encoding") continue; // we send full body
+              resHeaders[k] = v;
+            }
+            res.writeHead(upstreamRes.statusCode, resHeaders);
+            res.end(resBody);
+          });
+        });
+
+        upstreamReq.on("error", (err) => {
+          const durationMs = Date.now() - startTime;
+          console.error(`[windsurf-proxy] ${reqUrl.pathname} error: ${err.message} (${durationMs}ms)`);
+          recordEvent({
+            timestamp: new Date().toISOString(),
+            method: req.method,
+            path: reqUrl.pathname,
+            ip: clientIp,
+            status: 502,
+            reason: err.message,
+            sessionId: session.id,
+            mode: "windsurf_proxy",
+          });
+          sendJson(res, 502, { error: { message: `upstream error: ${err.message}` } });
+        });
+
+        upstreamReq.on("timeout", () => {
+          upstreamReq.destroy();
+          sendJson(res, 504, { error: { message: "upstream timeout" } });
+        });
+
+        upstreamReq.write(modifiedBody);
+        upstreamReq.end();
+      } catch (err) {
+        console.error(`[windsurf-proxy] ${reqUrl.pathname} processing error:`, err.message);
+        sendJson(res, 500, { error: { message: `proxy processing error: ${err.message}` } });
+      }
+    });
+    return;
   }
 
   return sendJson(res, 404, { error: { message: "not found" } });

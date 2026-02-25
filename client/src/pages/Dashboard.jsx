@@ -53,7 +53,7 @@ export default function Dashboard({ user, setUser }) {
     let gatewayUrl = null;
     try {
       const cfg = await api.proxyConfig();
-      if (cfg.pool) gatewayUrl = `https://${cfg.pool.upstream_ip || "47.84.31.126"}:18790`;
+      if (cfg.pool) gatewayUrl = `http://${cfg.pool.upstream_ip || "47.84.31.126"}:18790`;
     } catch {}
     const r = await proxyRun(gatewayUrl);
     showMsg(isNative() ? "\u4ee3\u7406\u5df2\u542f\u52a8\uff0c\u53ef\u4ee5\u4f7f\u7528 Windsurf \u4e86" : "\u4ee3\u7406\u5df2\u542f\u52a8\uff08\u6d4f\u89c8\u5668\u6a21\u62df\uff09");

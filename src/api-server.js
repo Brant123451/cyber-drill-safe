@@ -37,6 +37,14 @@ import {
   logRequest,
   getUserLogs,
   getTodayUsage,
+  generateActivationCodes,
+  listActivationCodes,
+  getActivationCodeStats,
+  redeemActivationCode,
+  getUserActiveSubscriptions,
+  getUserAllSubscriptions,
+  getEffectiveSubscription,
+  setPreferredPlan,
 } from "./database.js";
 
 import fs from "node:fs";
@@ -57,14 +65,35 @@ function syncSessionsFile() {
   const accounts = getAllPoolAccounts();
   const sessions = accounts
     .filter((a) => a.status === "active")
-    .map((a) => ({
-      id: `db-${a.id}`,
-      platform: a.platform || "codeium",
-      sessionToken: a.session_token,
-      label: a.label,
-      poolName: a.pool_name,
-      enabled: true,
-    }));
+    .map((a) => {
+      // session_token may be JSON-wrapped (from bulk import) or a plain string
+      let sessionToken = a.session_token;
+      let extra = {};
+      try {
+        const parsed = JSON.parse(a.session_token);
+        if (parsed && typeof parsed === "object" && parsed.apiKey) {
+          sessionToken = parsed.apiKey;
+          extra = {
+            apiKey: parsed.apiKey,
+            firebaseIdToken: parsed.firebaseIdToken || null,
+            uid: parsed.uid || null,
+          };
+        }
+      } catch {
+        // plain string session token
+      }
+
+      return {
+        id: `db-${a.id}`,
+        platform: a.platform || "codeium",
+        sessionToken,
+        email: extra.email || a.label,
+        label: a.label,
+        poolName: a.pool_name,
+        enabled: true,
+        extra,
+      };
+    });
 
   const dir = path.dirname(SESSIONS_FILE);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -137,12 +166,18 @@ app.get("/api/auth/me", authRequired, (req, res) => {
   const usage = getTodayUsage(user.id);
   const sub = getSubscription(user.subscription);
   const pool = user.pool_id ? getPoolById(user.pool_id) : null;
+  const activeSubs = getUserActiveSubscriptions(user.id);
+  const allSubs = getUserAllSubscriptions(user.id);
+  const effectiveSub = getEffectiveSubscription(user.id);
 
   res.json({
     ...user,
     today_usage: usage,
     subscription_detail: sub,
     pool: pool ? { id: pool.id, name: pool.name, code: pool.code, region: pool.region, status: pool.status, latency_ms: pool.latency_ms } : null,
+    active_subscriptions: activeSubs,
+    subscription_history: allSubs,
+    effective_subscription: effectiveSub || null,
   });
 });
 
@@ -305,6 +340,98 @@ app.post("/api/subscriptions/activate", authRequired, (req, res) => {
 });
 
 // ============================================================
+// Activation code routes
+// ============================================================
+
+// User redeems an activation code
+app.post("/api/activation/redeem", authRequired, (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code || !code.trim()) {
+      return res.status(400).json({ error: "请输入激活码" });
+    }
+    const result = redeemActivationCode(req.user.id, code.trim().toUpperCase());
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// User sets preferred plan (manual priority switching)
+app.post("/api/subscriptions/prefer", authRequired, (req, res) => {
+  try {
+    const { plan } = req.body;
+    setPreferredPlan(req.user.id, plan || null);
+    const effective = getEffectiveSubscription(req.user.id);
+    res.json({ ok: true, effective: effective || null });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// User views their subscription history
+app.get("/api/subscriptions/history", authRequired, (req, res) => {
+  const allSubs = getUserAllSubscriptions(req.user.id);
+  const activeSubs = getUserActiveSubscriptions(req.user.id);
+  const effective = getEffectiveSubscription(req.user.id);
+  res.json({ subscriptions: allSubs, active: activeSubs, effective: effective || null });
+});
+
+// Admin: generate activation codes
+app.post("/api/admin/activation/generate", authRequired, adminRequired, (req, res) => {
+  try {
+    const { plan, duration_hours, count } = req.body;
+    if (!plan || !duration_hours || !count) {
+      return res.status(400).json({ error: "plan, duration_hours, and count are required" });
+    }
+    const validPlans = ["basic", "pro", "unlimited"];
+    if (!validPlans.includes(plan)) {
+      return res.status(400).json({ error: `plan must be one of: ${validPlans.join(", ")}` });
+    }
+    if (count < 1 || count > 500) {
+      return res.status(400).json({ error: "count must be between 1 and 500" });
+    }
+    const result = generateActivationCodes(plan, parseInt(duration_hours), parseInt(count));
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: list activation codes
+app.get("/api/admin/activation/list", authRequired, adminRequired, (req, res) => {
+  const { status, batch_id, limit, offset } = req.query;
+  const codes = listActivationCodes({
+    status: status || undefined,
+    batchId: batch_id || undefined,
+    limit: parseInt(limit) || 100,
+    offset: parseInt(offset) || 0,
+  });
+  const stats = getActivationCodeStats();
+  res.json({ codes, stats });
+});
+
+// Admin: export unused codes as plain text (one per line, for pasting into ldxp.cn)
+app.get("/api/admin/activation/export", authRequired, adminRequired, (req, res) => {
+  const { plan, batch_id } = req.query;
+  let sql = "SELECT code FROM activation_codes WHERE status = 'unused'";
+  const params = [];
+  if (plan) { sql += " AND plan = ?"; params.push(plan); }
+  if (batch_id) { sql += " AND batch_id = ?"; params.push(batch_id); }
+  sql += " ORDER BY created_at ASC";
+
+  const d = getDb();
+  const rows = d.prepare(sql).all(...params);
+  const text = rows.map((r) => r.code).join("\n");
+  res.type("text/plain").send(text);
+});
+
+// Admin: get activation code stats
+app.get("/api/admin/activation/stats", authRequired, adminRequired, (req, res) => {
+  res.json(getActivationCodeStats());
+});
+
+// ============================================================
 // Announcement routes
 // ============================================================
 
@@ -377,6 +504,93 @@ app.post("/api/admin/users/:id/role", authRequired, adminRequired, (req, res) =>
   const db = getDb();
   db.prepare("UPDATE users SET role = ? WHERE id = ?").run(role, parseInt(req.params.id));
   res.json({ ok: true });
+});
+
+// ============================================================
+// Bulk import Windsurf accounts
+// ============================================================
+
+app.post("/api/admin/import-windsurf-accounts", authRequired, adminRequired, (req, res) => {
+  try {
+    const { accounts, pool_id, file } = req.body;
+
+    // Determine target pool
+    let targetPoolId = pool_id;
+    if (!targetPoolId) {
+      // Auto-create or find default pool
+      const pools = getAllPools();
+      const defaultPool = pools.find((p) => p.code === "default") || pools[0];
+      if (defaultPool) {
+        targetPoolId = defaultPool.id;
+      } else {
+        const newPool = createPool("Default Pool", "default", "internal", "auto", "");
+        targetPoolId = newPool.id;
+      }
+    }
+
+    // Load accounts from file or request body
+    let accountList = accounts;
+    if (!accountList && file) {
+      const filePath = path.resolve(PROJECT_ROOT, file);
+      if (!fs.existsSync(filePath)) {
+        return res.status(400).json({ error: `file not found: ${file}` });
+      }
+      const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      accountList = raw.accounts || raw;
+    }
+
+    if (!Array.isArray(accountList) || accountList.length === 0) {
+      return res.status(400).json({ error: "no accounts provided" });
+    }
+
+    const imported = [];
+    const skipped = [];
+    const d = getDb();
+
+    for (const acc of accountList) {
+      const apiKey = acc.apiKey || acc.api_key || acc.sessionToken || acc.session_token;
+      if (!apiKey) {
+        skipped.push({ email: acc.email, reason: "no apiKey" });
+        continue;
+      }
+
+      // Check for duplicate (same session_token in same pool)
+      const existing = d.prepare(
+        "SELECT id FROM pool_accounts WHERE pool_id = ? AND session_token = ?"
+      ).get(targetPoolId, apiKey);
+      if (existing) {
+        skipped.push({ email: acc.email, reason: "duplicate" });
+        continue;
+      }
+
+      const label = acc.email || acc.label || `account-${Date.now()}`;
+      const platform = acc.platform || "codeium";
+
+      // Store extra fields (firebaseIdToken, uid, etc.) in session_token as JSON-wrapped
+      const sessionData = JSON.stringify({
+        apiKey,
+        firebaseIdToken: acc.firebaseIdToken || acc.firebase_id_token || null,
+        uid: acc.uid || null,
+        email: acc.email || null,
+        expiresAt: acc.expiresAt || acc.expires_at || null,
+      });
+
+      addPoolAccount(targetPoolId, label, sessionData, platform, 80000);
+      imported.push({ email: acc.email, label });
+    }
+
+    syncSessionsFile();
+
+    res.json({
+      ok: true,
+      pool_id: targetPoolId,
+      imported: imported.length,
+      skipped: skipped.length,
+      details: { imported, skipped },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ============================================================

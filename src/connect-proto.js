@@ -231,9 +231,143 @@ export function* decodeConnectFrames(buf) {
 }
 
 /**
- * Extract text delta from a streaming response protobuf frame
- * Based on captured response structure where field 3 contains the text chunk
+ * Parse protobuf message into raw field entries, preserving raw bytes for pass-through.
+ * Each entry: { number, wireType, data (Buffer, for LEN fields only), rawBytes }
  */
+export function parseRawFields(buf) {
+  const result = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    const startOffset = offset;
+    let tag, tagBytes;
+    try {
+      const r = readVarint(buf, offset);
+      tag = r.value;
+      tagBytes = r.bytesRead;
+    } catch { break; }
+    offset += tagBytes;
+    const fieldNumber = Number(tag >> 3n);
+    const wireType = Number(tag & 7n);
+    if (fieldNumber === 0) break;
+
+    switch (wireType) {
+      case 0: {
+        try {
+          const { bytesRead } = readVarint(buf, offset);
+          offset += bytesRead;
+        } catch { return result; }
+        result.push({ number: fieldNumber, wireType, rawBytes: buf.subarray(startOffset, offset) });
+        break;
+      }
+      case 1: {
+        if (offset + 8 > buf.length) return result;
+        offset += 8;
+        result.push({ number: fieldNumber, wireType, rawBytes: buf.subarray(startOffset, offset) });
+        break;
+      }
+      case 2: {
+        let len;
+        try {
+          const r = readVarint(buf, offset);
+          len = Number(r.value);
+          offset += r.bytesRead;
+        } catch { return result; }
+        if (offset + len > buf.length) return result;
+        const data = buf.subarray(offset, offset + len);
+        offset += len;
+        result.push({ number: fieldNumber, wireType, data, rawBytes: buf.subarray(startOffset, offset) });
+        break;
+      }
+      case 5: {
+        if (offset + 4 > buf.length) return result;
+        offset += 4;
+        result.push({ number: fieldNumber, wireType, rawBytes: buf.subarray(startOffset, offset) });
+        break;
+      }
+      default:
+        return result;
+    }
+  }
+  return result;
+}
+
+/**
+ * Replace api_key (field 3) and optionally jwtToken (field 21) in a ClientMetadata submessage.
+ */
+function replaceMetaCredentials(metaBytes, newApiKey, newJwtToken) {
+  const fields = parseRawFields(metaBytes);
+  const parts = [];
+  let hasField3 = false;
+  for (const f of fields) {
+    if (f.number === 3 && f.wireType === 2) {
+      const w = new ProtoWriter();
+      w.writeStringField(3, newApiKey);
+      parts.push(w.finish());
+      hasField3 = true;
+    } else if (f.number === 21 && f.wireType === 2) {
+      if (newJwtToken) {
+        const w = new ProtoWriter();
+        w.writeStringField(21, newJwtToken);
+        parts.push(w.finish());
+      }
+      // else: strip jwtToken if we don't have one
+    } else {
+      parts.push(f.rawBytes);
+    }
+  }
+  // If original had no field 3, inject it
+  if (!hasField3) {
+    const w = new ProtoWriter();
+    w.writeStringField(3, newApiKey);
+    parts.unshift(w.finish());
+  }
+  return Buffer.concat(parts);
+}
+
+/**
+ * Replace credentials in a Connect protocol frame buffer.
+ * Swaps field 1.3 (api_key) and field 1.21 (jwtToken) in the protobuf.
+ * @param {Buffer} frameBuffer - Full Connect frame (5-byte header + payload)
+ * @param {string} newApiKey - New api_key to inject
+ * @param {string|null} newJwtToken - New JWT token, or null to strip
+ * @returns {Buffer} New Connect frame with replaced credentials
+ */
+export function replaceConnectCredentials(frameBuffer, newApiKey, newJwtToken) {
+  if (!frameBuffer || frameBuffer.length < 5) return frameBuffer;
+
+  const flags = frameBuffer[0];
+  const frameLen = frameBuffer.readUInt32BE(1);
+  if (5 + frameLen > frameBuffer.length) return frameBuffer;
+  const payload = frameBuffer.subarray(5, 5 + frameLen);
+  const isCompressed = !!(flags & 0x01);
+
+  let protobufData;
+  try {
+    protobufData = isCompressed ? zlib.gunzipSync(payload) : payload;
+  } catch {
+    return frameBuffer;
+  }
+
+  const outerFields = parseRawFields(protobufData);
+  if (outerFields.length === 0) return frameBuffer;
+
+  const parts = [];
+  for (const f of outerFields) {
+    if (f.number === 1 && f.wireType === 2) {
+      // ClientMetadata submessage — replace credentials
+      const newMetaBytes = replaceMetaCredentials(f.data, newApiKey, newJwtToken);
+      const w = new ProtoWriter();
+      w.writeBytesField(1, newMetaBytes);
+      parts.push(w.finish());
+    } else {
+      parts.push(f.rawBytes);
+    }
+  }
+
+  const newProtobuf = Buffer.concat(parts);
+  return encodeConnectFrame(newProtobuf, isCompressed);
+}
+
 export function extractStreamDelta(frameData) {
   const fields = decodeProto(frameData);
   const responseId = getStringField(fields, 1); // "bot-{uuid}"
@@ -271,3 +405,5 @@ export function extractStreamDelta(frameData) {
 
   return { responseId, textDelta, usage };
 }
+
+// (re-exported from protocol-adapter.js)

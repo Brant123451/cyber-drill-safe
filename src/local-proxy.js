@@ -37,17 +37,20 @@ const ORIGINAL_PORT = 443;
 // 解析命令行参数
 const args = process.argv.slice(2);
 let GATEWAY_URL = null;
+let CERT_DIR = path.join(PROJECT_ROOT, "certs");
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--gateway" && args[i + 1]) {
     GATEWAY_URL = args[i + 1];
-    break;
+  }
+  if (args[i] === "--cert-dir" && args[i + 1]) {
+    CERT_DIR = args[i + 1];
   }
 }
 
 // TLS 证书
 const tlsOptions = {
-  key: fs.readFileSync(path.join(PROJECT_ROOT, "certs", "server.key")),
-  cert: fs.readFileSync(path.join(PROJECT_ROOT, "certs", "server.crt")),
+  key: fs.readFileSync(path.join(CERT_DIR, "server.key")),
+  cert: fs.readFileSync(path.join(CERT_DIR, "server.crt")),
 };
 
 // 解析官方域名的真实 IP（因为 hosts 被改了，不能用域名连）
