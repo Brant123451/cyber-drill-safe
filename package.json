@@ -11,7 +11,10 @@
     "setup:ps": "powershell -ExecutionPolicy Bypass -File scripts/setup-gateway.ps1",
     "deploy:ps": "powershell -ExecutionPolicy Bypass -File scripts/deploy-gateway.ps1",
     "restart:ps": "powershell -ExecutionPolicy Bypass -File scripts/restart-gateway.ps1",
-    "start": "node src/lab-server.js",
+    "start": "node src/start-server.js",
+    "start:api": "node src/api-server.js",
+    "start:gateway": "node src/lab-server.js",
+    "seed": "node scripts/seed-db.mjs",
     "start:ps": "powershell -ExecutionPolicy Bypass -File scripts/start-gateway.ps1",
     "smoke:ps": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
     "accounts:status": "powershell -ExecutionPolicy Bypass -File scripts/account-pool.ps1 -Action status",
@@ -29,7 +32,21 @@
     "automation:login": "node src/account-automation.js login",
     "automation:batch": "node src/account-automation.js batch",
     "automation:platforms": "node src/account-automation.js platforms",
+    "register": "node scripts/windsurf-registrar.js register",
+    "register:headful": "node scripts/windsurf-registrar.js register --headful",
+    "register:batch": "node scripts/windsurf-registrar.js batch",
+    "register:status": "node scripts/windsurf-registrar.js status",
     "check": "node --check src/lab-server.js",
     "reset": "powershell -NoProfile -Command \"Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/reset\""
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "puppeteer": "^24.37.5",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }

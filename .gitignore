@@ -2,6 +2,22 @@ node_modules/
 .env
 config/accounts.json
 config/users.json
+config/sessions.json
 logs/
 run/
+data/
 *.pid
+
+# Client build
+client/dist/
+client/dist-electron/
+client/src-tauri/target/
+client/src-tauri/app-icon.png
+
+# Captures (binary protocol dumps)
+captures/
+
+# Deployment
+wind-server-deploy.tar.gz
+E:/electron-tmp/
+E:/electron-cache/

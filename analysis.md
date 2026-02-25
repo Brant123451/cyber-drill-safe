@@ -436,5 +436,404 @@ windocker01.lgtc.top
 
 ---
 
-*文档生成时间：2025-02-23*
-*用途：技术架构研究*
+## 八、自建实现方案（cyber-drill-safe 项目）
+
+### 8.1 已实现的完整技术栈
+
+基于上述架构分析，本项目已完整实现了一套 MITM 代理 + 账号池 + 用户管理系统。
+
+**协议层**：
+- Connect Protocol v1 + Protobuf + gzip 编解码（`src/connect-proto.js`）
+- Windsurf/Codeium 专用协议适配器（`src/protocol-adapter.js` → `CodeiumAdapter`）
+- 目标域名：`server.self-serve.windsurf.com`，核心端点：`GetChatMessage`
+- TLS 证书伪造：用 mitmproxy CA 签发 `server.self-serve.windsurf.com` 证书（`certs/`）
+
+**本地代理**（用户电脑上运行）：
+- `src/local-proxy.js`：监听 `127.0.0.1:443`
+- 通过修改 hosts 文件劫持 Windsurf 流量
+- 支持透传模式（抓包）和网关模式（`--gateway http://IP:18790`）
+- DNS 解析绕过本机 hosts（使用 8.8.8.8 / 1.1.1.1）
+
+**网关服务器**（`src/lab-server.js`，端口 18790）：
+- 账号池管理：从 `config/accounts.json` 加载，支持热重载
+- Session 管理：`src/session-manager.js`，支持心跳保活、健康检查、自动禁用/恢复
+- 用户管理：`src/user-manager.js`，积分系统（积分恢复、限额）
+- 请求调度：最少使用优先（Least-Used）策略选号
+- 安全审计：令牌速率限制、提示词注入检测、敏感信息探测
+- 流式转发：支持 SSE 流式透传和非流式响应
+
+**API 服务器**（`src/api-server.js`，端口 18800）：
+- 用户注册/登录（JWT 认证，bcryptjs 密码哈希）
+- 号池管理（创建/删除号池，号池账号 CRUD）
+- 订阅系统（free/basic/pro/unlimited 四档）
+- 公告系统
+- 请求日志记录
+
+**数据库**（`src/database.js`，SQLite）：
+```
+users           — 用户表（用户名、邮箱、密码哈希、订阅、积分）
+pools           — 号池表（名称、编号、区域、上游IP、延迟）
+pool_accounts   — 号池账号表（session_token、平台、状态、用量）
+subscriptions   — 订阅套餐表（积分上限、恢复间隔、价格）
+announcements   — 系统公告表
+request_logs    — 请求日志表
+```
+
+### 8.2 客户端实现
+
+**技术栈**：React + TailwindCSS + React Router，Electron 桌面封装
+
+**页面**：
+| 页面 | 功能 |
+|------|------|
+| 登录/注册 | JWT 认证，支持注册和登录 |
+| 仪表盘 | 当前号池、配置状态、系统公告、操作按钮 |
+| 我的订阅 | 积分用量、动态倒计时恢复、多订阅优先切换 |
+| 获取订阅 | 按时/激活码两种方式，基础/专业/旗舰三档 |
+
+**核心操作按钮**：
+| 按钮 | 实际操作 |
+|------|---------|
+| 一键探测选路 | 并发 TCP ping 所有号池，自动选延迟最低的，右上角 toast 提示 |
+| 初始化 | 修改 `C:\Windows\System32\drivers\etc\hosts`，加入 `127.0.0.1 server.self-serve.windsurf.com` |
+| 运行切号 | 初始化 hosts + 启动 `local-proxy.js` 子进程，从 API 获取号池配置转发到网关 |
+| 停止运行 | 杀掉本地代理进程 |
+| 还原初始化 | 停止代理 + 删除 hosts 条目 |
+
+**Electron IPC 架构**：
+```
+React 渲染进程
+    │ window.electronAPI.proxyRun()
+    ▼
+preload.js（contextBridge）
+    │ ipcRenderer.invoke('proxy:run')
+    ▼
+main.js（Electron 主进程）
+    │ proxy-manager.js
+    ▼
+操作系统（hosts 文件 + 子进程管理）
+```
+
+**订阅系统**：
+- 所有套餐积分上限均为 1000
+- 区别在于恢复间隔：免费 24h、基础 5h、专业 3h、旗舰 1h
+- 支持多个订阅同时生效，用户可切换"已优先/设为优先"
+- 积分已满时显示"积分已满"标签
+- 动态倒计时（每秒刷新）显示恢复剩余时间
+
+### 8.3 部署架构
+
+```
+用户电脑 (Wind Client EXE)              阿里云 ECS (39.97.51.119)
+┌─────────────────────────┐           ┌─────────────────────────┐
+│ Electron 桌面应用        │   HTTP    │                         │
+│   ├─ React UI           │ ────────► │  API Server :18800      │
+│   └─ proxy-manager.js   │           │  (Express + SQLite)     │
+│                         │           │  用户/订阅/号池/公告     │
+│ local-proxy.js          │   HTTPS   │                         │
+│ (127.0.0.1:443)         │ ────────► │  Gateway :18790         │
+│   ├─ hosts 劫持         │           │  (lab-server.js)        │
+│   └─ TLS 伪造证书       │           │  账号池调度/转发/审计    │
+└─────────────────────────┘           └───────────┬─────────────┘
+                                                  │
+                                                  │ HTTPS (真实证书)
+                                                  ▼
+                                      Windsurf 官方后端
+                                      server.self-serve.windsurf.com
+```
+
+**统一启动**：`node src/start-server.js` 同时启动 API + Gateway
+
+**部署方式**：
+- `scripts/deploy-server.sh`：rsync 上传 + systemd 服务注册
+- 安全组需开放：18800/TCP（API）、18790/TCP（Gateway）
+
+**号池账号管理**（管理员 API）：
+```bash
+# 添加 Windsurf 账号到号池
+POST /api/admin/pool-accounts
+{ "pool_id": 1, "label": "ws-01", "session_token": "<token>" }
+
+# 查看所有账号（token 脱敏）
+GET /api/admin/pool-accounts
+
+# 禁用/启用账号
+POST /api/admin/pool-accounts/:id/status
+{ "status": "disabled" }
+```
+
+数据库 `pool_accounts` 表的账号会自动同步到 `config/sessions.json`，Gateway 热加载使用。
+
+### 8.4 服务器选址建议
+
+| | 国内服务器 | 国外服务器（香港/日本） |
+|---|---|---|
+| 到 Windsurf 官方延迟 | 高（200-500ms），可能被墙 | 低（10-50ms） |
+| 国内用户访问延迟 | 低 | 中等（50-100ms） |
+| 备案要求 | 需要 | 不需要 |
+| 推荐程度 | ⚠️ 需测试连通性 | ✅ 推荐 |
+
+### 8.5 关键文件索引
+
+```
+cyber-drill-safe/
+├── src/
+│   ├── api-server.js          # API 服务（用户管理、订阅、号池）
+│   ├── lab-server.js          # Gateway 网关（账号池调度、转发）
+│   ├── start-server.js        # 统一启动入口
+│   ├── database.js            # SQLite 数据层
+│   ├── local-proxy.js         # 本地 HTTPS 代理
+│   ├── connect-proto.js       # Connect Protocol 编解码
+│   ├── protocol-adapter.js    # 平台协议适配器
+│   ├── session-manager.js     # Session 池管理（保活/健康检查）
+│   └── user-manager.js        # 用户积分/配额管理
+├── client/
+│   ├── electron/
+│   │   ├── main.js            # Electron 主进程
+│   │   ├── preload.js         # IPC 桥接
+│   │   └── proxy-manager.js   # hosts/代理进程管理
+│   └── src/
+│       ├── api.js             # API 客户端
+│       ├── App.jsx            # 路由
+│       └── pages/
+│           ├── Login.jsx      # 登录/注册
+│           ├── Dashboard.jsx  # 仪表盘
+│           ├── Subscription.jsx  # 我的订阅
+│           └── GetSubscription.jsx  # 获取订阅
+├── certs/                     # TLS 伪造证书
+├── config/                    # 运行时配置（accounts.json, sessions.json）
+├── scripts/
+│   ├── deploy-server.sh       # 服务器部署脚本
+│   └── seed-db.mjs            # 数据库种子数据
+└── data/
+    └── wind.db                # SQLite 数据库
+```
+
+---
+
+---
+
+## 九、实际抓包情报分析（2026-02-25）
+
+> 以下内容来自使用 `local-proxy.js` 透传模式抓取的真实流量数据（`captures/` 目录），
+> 对当前使用的第三方代理团队进行逆向分析。
+
+### 9.1 账号完整画像
+
+通过解码 `GetUserJwt` 响应中的 JWT token，获得以下账号信息：
+
+| 字段 | 值 | 来源 |
+|------|------|------|
+| **用户名** | Charlotte Allen | JWT `name` |
+| **邮箱** | `zYNPDekEPcKuELFiqF@qq.com` | JWT `email` |
+| **API Key** | `2b809a22-15e4-4e25-9049-dfde9f16f4b7` | JWT `api_key` |
+| **Auth UID** | `HgCva2Y1bOYS5s3tBYVbw7MhTye2` | JWT `auth_uid`（Firebase Auth 格式） |
+| **Team ID** | `a29a18c4-044b-4c63-9532-581cc0c390f5` | JWT `team_id` |
+| **Pro 状态** | `false` | JWT `pro` |
+| **Teams Tier** | `TEAMS_TIER_UNSPECIFIED` | JWT `teams_tier` |
+| **Team Status** | `USER_TEAM_STATUS_APPROVED` | JWT `team_status` |
+| **Pro 试用到期** | `2026-02-17T17:10:09.637375Z`（**已过期**） | JWT `windsurf_pro_trial_end_time` |
+| **Premium Chat 消息数** | `0` | JWT `max_num_premium_chat_messages` |
+| **GetUserStatus 订阅层级** | `Free` | protobuf 响应 @offset 96 |
+
+**结论：这是一个已过期的 14 天免费试用号，不是付费 Pro 账号。**
+
+### 9.2 账号注册模式分析
+
+| 特征 | 值 | 推断 |
+|------|------|------|
+| **邮箱格式** | `zYNPDekEPcKuELFiqF@qq.com` — 18位随机字母 | 批量随机生成，不是人工注册 |
+| **用户名** | "Charlotte Allen" — 标准英文名 | 使用 fake name generator 批量生成 |
+| **Auth UID 格式** | `HgCva2Y1bOYS5s3tBYVbw7MhTye2` | Firebase Authentication UID |
+| **注册时间推算** | 试用到期 2月17日 - 14天 = 约 **2月3日** 注册 | 每 14 天需要补充新号 |
+
+**推断注册自动化流程：**
+
+```
+1. 生成随机 QQ 邮箱地址（18位随机字母@qq.com）
+   → 可能使用 QQ 邮箱别名功能，或者有大量 QQ 邮箱资源
+   → 也可能使用 catch-all 域名邮箱伪装成 @qq.com
+
+2. 访问 Windsurf 注册页面（Firebase Auth）
+   → Puppeteer/Playwright 自动化填写
+   → 或者直接调用 Firebase Auth REST API 注册
+
+3. 邮箱验证
+   → 如果是真实 QQ 邮箱：通过 QQ 邮箱 IMAP/POP3 协议自动读取验证邮件
+   → 如果是 catch-all：自建邮件服务器接收验证邮件
+   → 可能 Windsurf 对部分邮箱不强制验证
+
+4. 注册完成，获得 14 天 Pro 试用
+   → 保存 API key (gsk-xxx) 和 auth credentials
+   → 加入账号池
+
+5. 14 天后试用过期，标记为废弃，切换到下一个新号
+```
+
+### 9.3 认证机制详解
+
+**API Key 格式**：`gsk-ws-01-tIMFYH3AZgeQ-76jK9DXK0qEUbViGRYPoH46UIC5iykcWL7Hs4SrhKmHKGLTmTChR2mcJbyNmcANSohNXDnyYOdI0Odjpw`
+
+- 前缀 `gsk-` = Codeium/Windsurf 的标准 API key 前缀
+- `ws-01` 可能是服务器分区标识
+- 尾部是 base62 编码的密钥
+
+**认证方式**：不是通过 HTTP `Authorization` header，而是**嵌入在 Protobuf 请求体内部**。每个 API 调用的 protobuf body 都包含：
+- API key（`gsk-xxx`）
+- JWT token（包含完整用户身份信息）
+
+这意味着代理团队在中间层做的是：**替换 protobuf body 内部的 API key 字段**，而不是替换 HTTP header。
+
+### 9.4 你被暴露的信息
+
+通过分析所有请求体，你的 Windsurf 客户端在每次 API 调用中都会发送以下设备信息：
+
+| 信息类型 | 具体值 | 风险等级 |
+|----------|--------|----------|
+| **操作系统** | Windows 10 Pro, Build 26100 | 低 |
+| **CPU 型号** | AMD Ryzen 5 7500F 6-Core Processor | 中 |
+| **CPU 详情** | 1 Socket, 6 Cores, 12 Threads, AuthenticAMD | 中 |
+| **系统架构** | amd64 | 低 |
+| **Windsurf 版本** | 1.48.2 | 低 |
+| **Language Server 版本** | 1.9544.28 | 低 |
+| **设备 ID** | `d9a3c0a1-41ed-42f3-82b9-9eba3e393990` | **高** |
+| **设备指纹** | `44fbc5a0671c985ab737...` (64字节 SHA) | **高** |
+| **安装路径** | `e:\Useless\windsurf\Windsurf\resources\app\extensions\windsurf` | 中 |
+
+### 9.5 对话内容泄露
+
+`GetChatMessage` 请求体（25,924 字节）中包含你发给 Cascade 的**完整对话上下文**，包括：
+
+1. **你的所有 Windsurf Memory 数据**（SYSTEM-RETRIEVED-MEMORY）：
+   - 阿里云 ECS IP 地址：`39.97.51.119`
+   - Neon 数据库配置：`DATABASE_URL`、`DATABASE_URL_UNPOOLED`
+   - 项目代码细节：Prisma schema、Creator Studio、PNG 导入流程等
+   - 浏览器 viewport 配置：1843x1308, devicePixelRatio=1.5
+   - character-tavern.com 复制计划
+
+2. **你的 IDE 元数据**：
+   - 当前打开的文件路径
+   - 光标位置
+   - 所有打开的工作区
+
+3. **对话历史**：
+   - 之前的用户消息和 AI 回复
+   - 系统 prompt 和特殊 token
+
+**⚠️ 这意味着代理团队可以看到你通过 Cascade 处理的所有代码、对话和项目信息。**
+
+### 9.6 额度/限流系统
+
+`CheckUserMessageRateLimit` 响应解码：
+
+| Protobuf 字段 | 值 | 推测含义 |
+|---------------|------|----------|
+| field 1 (varint) | `1` | 是否允许发送（1=允许） |
+| field 3 (varint) | `29` | 剩余 credits |
+| field 4 (varint) | `30` | 总 credits 上限 |
+| field 5 (varint) | `3195` | 可能是重置倒计时（秒）或累计用量 |
+
+**关键发现**：该试用号总共只有 **30 credits**，抓包时剩余 **29 credits**（刚用了1个）。
+
+### 9.7 Windsurf 后端基础设施
+
+从响应 headers 中可以判断：
+
+| 信息 | 值 | 说明 |
+|------|------|------|
+| **CDN/代理** | `via: 1.1 google` | 后端在 Google Cloud 上 |
+| **协议** | HTTP/3 支持（`alt-svc: h3=":443"`) | 现代基础设施 |
+| **后端框架** | Connect Protocol (Go) | `user-agent: connect-go/1.18.1 (go1.25.5)` |
+| **序列化** | Protobuf (`application/proto`) | 非 JSON |
+| **压缩** | gzip | 所有请求/响应都压缩 |
+| **监控** | Sentry | `sentry-release=language-server-windsurf@1.9544.28` |
+| **Sentry DSN** | `b813f73488da69eedec534dba1029111` | Sentry public key |
+
+### 9.8 模型状态情报
+
+`GetModelStatuses` 响应显示 `MODEL_CLAUDE_3_5_HAIKU_20241022` 正在经历高错误率：
+
+> "Model is currently experiencing elevated error rate, responses may be unreliable."
+
+`GetCommandModelConfigs` 显示默认 Cascade 模型为 `Windsurf Fast`（`MODEL_CHAT_11121`）。
+
+`GetChatMessage` 响应显示实际使用的模型：
+- 第一次对话：`MODEL_SWE_1_5_SLOW`（SWE-1.5）
+- 第二次对话：`MODEL_GOOGLE_GEMINI_2_5_FLASH`（Gemini 2.5 Flash）
+
+**关键发现**：`GetUserStatus` 中的 Premium / Value / Free 标签不是访问限制，而是**积分消耗等级**。免费试用号可以使用**全部模型**（包括 Claude Opus 4.6、GPT-5.2 等），区别在于：
+- **Free 模型**（SWE-1.5、GPT-5.1-Codex）：不消耗 credits，可无限调用
+- **Value 模型**（GPT-5 Low、Kimi K2）：消耗少量 credits
+- **Premium 模型**（Claude Opus 4.6、GPT-5.2）：消耗较多 credits
+
+代理团队提供的是**全模型访问**服务，用户主要使用 Premium 模型（Claude Opus、GPT-5 等），因此每个试用号的 30 credits 消耗很快（约 10-30 次 Premium 对话）。这意味着账号池需要**高频补充**——10 个活跃用户每天可能消耗 10-50 个试用号，团队的核心竞争力在于**批量注册自动化的速度和规模**。
+
+### 9.9 Team 配置详情
+
+JWT 中的 `team_config` 字段（JSON 字符串）：
+
+```json
+{
+  "allowMcpServers": true,
+  "allowAutoRunCommands": true,
+  "allowCustomRecipes": true,
+  "maxUnclaimedSites": 1,
+  "allowAppDeployments": true,
+  "allowSandboxAppDeployments": true,
+  "maxNewSitesPerDay": 1,
+  "allowBrowserExperimentalFeatures": true,
+  "allowCodemapSharing": "enabled",
+  "disableLifeguard": true,
+  "maxCascadeAutoExecutionLevel": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+  "allowArenaMode": true
+}
+```
+
+注意 `disableLifeguard: true` — Lifeguard 是 Windsurf 的安全审查系统，这里被禁用了，说明注册时可能通过某种方式绕过了安全限制。
+
+### 9.10 完整通信时序
+
+```
+时间戳(ms)        端点                          方向    大小
+───────────────────────────────────────────────────────────
+204948            Ping                          → ←     0 / 23B
+204951            GetDefaultWorkflowTemplates   → ←     568 / 23B
+205004            GetUserStatus                 → ←     405 / 5532B
+205288            GetUserJwt                    → ←     405 / 924B    ← JWT含完整身份
+205550            GetStatus                     → ←     1489 / 26B
+205560            GetUserJwt                    → ←     405 / 922B
+205821            GetCommandModelConfigs        → ←     1487 / 80B
+206091            GetProfileData                → ←     105 / 23B
+206115            GetUserStatus                 → ←     404 / 5532B
+206434            GetUserJwt                    → ←     156 / 918B    ← 不同请求体大小
+206444            GetUserStatus                 → ←     156 / 5800B   ← 不同响应大小
+206694            GetModelStatuses              → ←     1307 / 148B
+210618            GetUserStatus                 → ←     404 / 5532B
+218966            CheckUserMessageRateLimit     → ←     1327 / 33B    ← 额度检查
+219776            GetUserStatus                 → ←     404 / 5532B
+221781            GetChatMessage                → ←     25924 / 5262B ← 你的对话(大)
+222134            GetUserStatus                 → ←     404 / 5532B
+223765            GetChatMessage                → ←     6022 / 1952B  ← 标题生成(小)
+232787            GetUserStatus                 → ←     156 / 5800B
+233224            GetUserStatus                 → ←     156 / 5800B
+235207            Ping                          → ←     0 / 23B
+```
+
+**观察**：
+- 启动时密集调用（身份验证 → 配置加载 → 模型列表）
+- `GetUserStatus` 被频繁轮询（11次/30秒）— 用于刷新订阅状态
+- 请求体有两种大小（405B vs 156B）：较大的包含完整设备信息，较小的是精简版
+- 第二次 `GetChatMessage`（6KB）是 AI 自动生成的对话标题请求
+
+### 9.11 信用卡问题结论
+
+**这个团队根本不需要信用卡。** 他们的完整运营模式是：
+
+1. **批量注册 QQ 邮箱**（或使用 catch-all 域名邮箱）
+2. **通过 Firebase Auth API 自动注册 Windsurf 账号**（不需要信用卡，免费注册即可）
+3. **获得 14 天 Pro 试用**（每个新号自动赠送）
+4. **14 天内通过 MITM 代理将试用额度分发给付费用户**
+5. **试用到期后丢弃该号，补充新的试用号**
+6. **成本 ≈ 0**（只需要服务器费用和邮箱资源）
+
+这是一个**零边际成本**的运营模式——不需要购买任何订阅，纯靠薅免费试用。

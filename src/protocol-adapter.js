@@ -16,6 +16,16 @@
 
 import https from "node:https";
 import http from "node:http";
+import {
+  ProtoWriter,
+  decodeProto,
+  getStringField,
+  getIntField,
+  getMessageField,
+  encodeConnectFrame,
+  decodeConnectFrames,
+  extractStreamDelta,
+} from "./connect-proto.js";
 import crypto from "node:crypto";
 
 // ============================================================
@@ -125,181 +135,211 @@ class OpenAIAdapter extends BaseAdapter {
 }
 
 // ============================================================
-// Codeium/Windsurf 适配器
+// Codeium/Windsurf 适配器 (reverse-engineered 2026-02-25)
 // ============================================================
-// ⚠️ 以下是框架代码。实际协议细节需要通过抓包逆向获取。
-// 标记 [REVERSE-REQUIRED] 的地方需要你根据实际抓包数据填充。
+// Protocol: Connect Protocol v1 + Protobuf + gzip
+// Domain:   server.self-serve.windsurf.com
+// Agent:    connect-go/1.18.1 (go1.25.5)
 
 class CodeiumAdapter extends BaseAdapter {
   constructor() {
     super("codeium");
-    // [REVERSE-REQUIRED] 目标平台 API 基址
-    this.apiBase = "https://api.codeium.com";
-    // [REVERSE-REQUIRED] 补全/聊天端点路径
-    this.chatEndpoint = "/exa.language_server_pb.LanguageServerService/GetChatCompletion";
-    // [REVERSE-REQUIRED] 保活端点
-    this.heartbeatEndpoint = "/exa.seat_management_pb.SeatManagementService/Heartbeat";
+    this.apiBase = "https://server.self-serve.windsurf.com";
+    this.chatEndpoint = "/exa.api_server_pb.ApiServerService/GetChatMessage";
+    this.pingEndpoint = "/exa.api_server_pb.ApiServerService/Ping";
+    this.userStatusEndpoint = "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+    this.rateLimitEndpoint = "/exa.api_server_pb.ApiServerService/CheckUserMessageRateLimit";
+
+    this._requestCounter = 0;
+  }
+
+  // Build the ClientMetadata protobuf (field 1 in most requests)
+  _buildClientMetadata(session) {
+    this._requestCounter++;
+    const meta = new ProtoWriter();
+    meta.writeStringField(1, "windsurf");
+    meta.writeStringField(2, session.editorVersion || "1.48.2");
+    meta.writeStringField(3, session.sessionToken); // api_key (sk-ws-01-...)
+    meta.writeStringField(4, session.locale || "en");
+    meta.writeStringField(5, session.osInfo || "windows");
+    meta.writeStringField(7, session.lsVersion || "1.9544.28");
+    meta.writeVarintField(9, this._requestCounter);
+    meta.writeStringField(10, session.machineId || crypto.randomUUID());
+    meta.writeStringField(12, "windsurf");
+    if (session.jwtToken) {
+      meta.writeStringField(21, session.jwtToken);
+    }
+    return meta;
   }
 
   toPlatform(openaiRequest, session) {
-    // [REVERSE-REQUIRED] 根据抓包数据填充实际请求格式
-    // 以下是推测性的框架结构
-    const requestBody = {
-      // Codeium 使用 protobuf，这里用 JSON 占位
-      // 实际可能需要用 protobuf 编码
-      metadata: {
-        ide_name: "windsurf",
-        ide_version: "1.0.0",
-        extension_version: "1.0.0",
-        api_key: session.sessionToken,
-        session_id: session.deviceId || crypto.randomUUID(),
-        request_id: BigInt(Date.now()).toString(),
-      },
-      chat_messages: this._convertMessages(openaiRequest.messages),
-      model: this._mapModel(openaiRequest.model),
-      stream: openaiRequest.stream ?? false,
-      // [REVERSE-REQUIRED] 编辑器上下文
-      editor_state: {
-        workspace_id: session.extra?.workspaceId || "default",
-        file_path: "",
-        language: "",
-        cursor_offset: 0,
-      },
-    };
+    const req = new ProtoWriter();
+
+    // field 1: ClientMetadata
+    req.writeMessageField(1, this._buildClientMetadata(session));
+
+    // field 3: Messages (repeated)
+    for (const msg of openaiRequest.messages || []) {
+      const m = new ProtoWriter();
+      m.writeVarintField(2, this._roleToInt(msg.role));
+      m.writeStringField(3, msg.content || "");
+      req.writeMessageField(3, m);
+    }
+
+    // field 8: ModelConfig
+    const cfg = new ProtoWriter();
+    cfg.writeVarintField(1, 1);
+    cfg.writeVarintField(2, openaiRequest.max_tokens || 8192);
+    cfg.writeVarintField(3, 200);
+    cfg.writeDoubleField(5, openaiRequest.temperature ?? 0.7);
+    cfg.writeDoubleField(6, openaiRequest.top_p ?? 0.9);
+    cfg.writeVarintField(7, 50);
+    // stop sequences (from capture: special tokens)
+    const STOP_SEQS = ["\x3c|user|\x3e", "\x3c|bot|\x3e", "\x3c|context_request|\x3e", "\x3c|endoftext|\x3e", "\x3c|end_of_turn|\x3e"];
+    for (const s of (openaiRequest.stop || STOP_SEQS)) {
+      cfg.writeStringField(9, s);
+    }
+    req.writeMessageField(8, cfg);
+
+    // field 21: model name
+    req.writeStringField(21, this._mapModel(openaiRequest.model));
+
+    // field 16: trajectory_id
+    req.writeStringField(16, session.trajectoryId || crypto.randomUUID());
+
+    // field 22: session_id
+    req.writeStringField(22, session.sessionId || crypto.randomUUID());
+
+    // field 20: streaming flag
+    req.writeVarintField(20, 1);
+
+    // Encode protobuf -> Connect envelope with gzip
+    const protobufData = req.finish();
+    const body = encodeConnectFrame(protobufData, true);
 
     return {
       url: `${this.apiBase}${this.chatEndpoint}`,
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        // [REVERSE-REQUIRED] 认证 header 格式
-        Authorization: `Bearer ${session.sessionToken}`,
-        "User-Agent": session.userAgent || "windsurf/1.0.0",
-        // [REVERSE-REQUIRED] 可能需要的额外 header
-        "X-Device-Id": session.deviceId || "",
+        "Content-Type": "application/connect+proto",
+        "Connect-Protocol-Version": "1",
+        "Connect-Content-Encoding": "gzip",
+        "Connect-Accept-Encoding": "gzip",
+        "Accept-Encoding": "identity",
+        "User-Agent": "connect-go/1.18.1 (go1.25.5)",
       },
-      body: JSON.stringify(requestBody),
+      body,
     };
   }
 
-  fromPlatform(platformResponse, meta) {
-    // [REVERSE-REQUIRED] 根据实际响应格式转换
-    const content = platformResponse?.completion?.text
-      || platformResponse?.generated_text
-      || platformResponse?.choices?.[0]?.message?.content
-      || JSON.stringify(platformResponse);
+  fromPlatform(platformResponseBuf, meta) {
+    // Parse all Connect frames from the response buffer
+    let fullText = "";
+    let usage = null;
+    let requestId = meta?.requestId || crypto.randomUUID();
+    let modelUsed = meta?.model || "windsurf-model";
+
+    for (const frame of decodeConnectFrames(platformResponseBuf)) {
+      if (frame.isEndOfStream) continue;
+      const delta = extractStreamDelta(frame.data);
+      if (delta.textDelta) fullText += delta.textDelta;
+      if (delta.usage) {
+        usage = delta.usage;
+        if (delta.usage.requestId) requestId = delta.usage.requestId;
+        if (delta.usage.model) modelUsed = delta.usage.model;
+      }
+    }
 
     return {
-      id: `chatcmpl-${meta?.requestId || crypto.randomUUID()}`,
+      id: requestId,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: meta?.model || "windsurf-model",
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content,
-          },
-          finish_reason: "stop",
-        },
-      ],
+      model: modelUsed,
+      choices: [{
+        index: 0,
+        message: { role: "assistant", content: fullText },
+        finish_reason: "stop",
+      }],
       usage: {
-        prompt_tokens: platformResponse?.usage?.input_tokens || 0,
-        completion_tokens: platformResponse?.usage?.output_tokens || 0,
-        total_tokens: platformResponse?.usage?.total_tokens || 0,
+        prompt_tokens: usage?.promptTokens || 0,
+        completion_tokens: usage?.completionTokens || 0,
+        total_tokens: (usage?.promptTokens || 0) + (usage?.completionTokens || 0),
       },
     };
   }
 
-  fromPlatformStreamChunk(eventData, meta) {
-    // [REVERSE-REQUIRED] 解析平台流式事件并转换为 OpenAI SSE chunk
-    try {
-      const parsed = JSON.parse(eventData);
-      const text = parsed?.completion?.text || parsed?.delta?.content || "";
+  fromPlatformStreamChunk(frameData, meta) {
+    // Parse a single Connect frame and convert to OpenAI SSE chunk
+    const delta = extractStreamDelta(frameData);
+    if (!delta.textDelta) return null;
 
-      if (!text) return null;
-
-      const chunk = {
-        id: `chatcmpl-${meta?.requestId || crypto.randomUUID()}`,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: meta?.model || "windsurf-model",
-        choices: [
-          {
-            index: 0,
-            delta: { content: text },
-            finish_reason: null,
-          },
-        ],
-      };
-
-      return JSON.stringify(chunk);
-    } catch {
-      return null;
-    }
+    const chunk = {
+      id: meta?.requestId || `chatcmpl-${crypto.randomUUID()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: delta.usage?.model || meta?.model || "windsurf-model",
+      choices: [{
+        index: 0,
+        delta: { content: delta.textDelta },
+        finish_reason: null,
+      }],
+    };
+    return JSON.stringify(chunk);
   }
 
   buildKeepaliveRequest(session) {
-    // [REVERSE-REQUIRED] 心跳请求格式
+    const req = new ProtoWriter();
+    req.writeMessageField(1, this._buildClientMetadata(session));
+    const body = encodeConnectFrame(req.finish(), false);
+
     return {
-      url: `${this.apiBase}${this.heartbeatEndpoint}`,
+      url: `${this.apiBase}${this.pingEndpoint}`,
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${session.sessionToken}`,
+        "Content-Type": "application/proto",
+        "User-Agent": "connect-go/1.18.1 (go1.25.5)",
       },
-      body: JSON.stringify({
-        metadata: {
-          api_key: session.sessionToken,
-          ide_name: "windsurf",
-        },
-      }),
+      body,
     };
   }
 
   buildHealthCheckRequest(session) {
-    // [REVERSE-REQUIRED] 健康检查
     return this.buildKeepaliveRequest(session);
   }
 
-  // ---- 内部工具 ----
-
-  _convertMessages(messages) {
-    return (messages || []).map((m) => ({
-      role: m.role === "assistant" ? "ASSISTANT" : m.role === "system" ? "SYSTEM" : "USER",
-      content: m.content || "",
-    }));
+  _roleToInt(role) {
+    switch (role) {
+      case "system": return 1;
+      case "user": return 2;
+      case "assistant": return 3;
+      default: return 2;
+    }
   }
 
   _mapModel(openaiModel) {
-    // [REVERSE-REQUIRED] 模型名映射
     const MAP = {
-      "gpt-4o": "gpt-4o",
-      "gpt-4": "gpt-4",
-      "claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
-      "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022",
-      "deepseek-chat": "deepseek-chat",
+      "gpt-4o": "MODEL_CHAT_GPT_4_O",
+      "gpt-4": "MODEL_CHAT_GPT_4",
+      "gpt-4.1": "MODEL_CHAT_GPT_4_1_2025_04_14",
+      "claude-3-5-sonnet": "MODEL_CLAUDE_3_5_SONNET",
+      "deepseek-chat": "MODEL_DEEPSEEK_V3",
+      "cascade": "MODEL_SWE_1_5_SLOW",
+      "cascade-fast": "MODEL_SWE_1_5_FAST",
     };
     return MAP[openaiModel] || openaiModel;
   }
 }
 
 // ============================================================
-// 适配器注册表
+// Adapter Registry
 // ============================================================
 
 const ADAPTERS = {
   openai: new OpenAIAdapter(),
   codeium: new CodeiumAdapter(),
-  windsurf: new CodeiumAdapter(), // windsurf 使用 codeium 后端
+  windsurf: new CodeiumAdapter(),
 };
 
-/**
- * 获取指定平台的协议适配器
- * @param {string} platform
- * @returns {BaseAdapter}
- */
 export function getAdapter(platform) {
   const adapter = ADAPTERS[platform?.toLowerCase()];
   if (!adapter) {
@@ -308,25 +348,14 @@ export function getAdapter(platform) {
   return adapter;
 }
 
-/**
- * 注册自定义适配器
- */
 export function registerAdapter(name, adapter) {
   ADAPTERS[name.toLowerCase()] = adapter;
 }
 
-/**
- * 通用的 HTTP 请求发送函数
- * 使用适配器生成的 { url, method, headers, body } 发送请求
- * @param {Object} reqSpec - { url, method, headers, body }
- * @param {number} [timeoutMs=30000]
- * @returns {Promise<{status: number, headers: Object, body: string}>}
- */
 export function sendAdapterRequest(reqSpec, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(reqSpec.url);
     const transport = parsed.protocol === "https:" ? https : http;
-
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
@@ -335,40 +364,22 @@ export function sendAdapterRequest(reqSpec, timeoutMs = 30000) {
       headers: reqSpec.headers || {},
       timeout: timeoutMs,
     };
-
     const req = transport.request(options, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
-        resolve({
-          status: res.statusCode,
-          headers: res.headers,
-          body: Buffer.concat(chunks).toString("utf8"),
-        });
-      });
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }));
     });
-
     req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("request timeout"));
-    });
-
-    if (reqSpec.body) {
-      req.write(reqSpec.body);
-    }
+    req.on("timeout", () => { req.destroy(); reject(new Error("request timeout")); });
+    if (reqSpec.body) req.write(reqSpec.body);
     req.end();
   });
 }
 
-/**
- * 流式请求 - 返回原始响应流用于 SSE 转发
- */
 export function sendAdapterStreamRequest(reqSpec, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(reqSpec.url);
     const transport = parsed.protocol === "https:" ? https : http;
-
     const options = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
@@ -377,20 +388,10 @@ export function sendAdapterStreamRequest(reqSpec, timeoutMs = 120000) {
       headers: reqSpec.headers || {},
       timeout: timeoutMs,
     };
-
-    const req = transport.request(options, (res) => {
-      resolve(res);
-    });
-
+    const req = transport.request(options, (res) => resolve(res));
     req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("stream request timeout"));
-    });
-
-    if (reqSpec.body) {
-      req.write(reqSpec.body);
-    }
+    req.on("timeout", () => { req.destroy(); reject(new Error("stream request timeout")); });
+    if (reqSpec.body) req.write(reqSpec.body);
     req.end();
   });
 }

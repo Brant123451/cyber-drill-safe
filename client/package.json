@@ -1,0 +1,73 @@
+{
+  "name": "wind-client",
+  "version": "1.0.0",
+  "description": "Wind Client - Windsurf Proxy Manager",
+  "main": "app-main/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "electron:build": "vite build && electron-builder",
+    "preview": "vite preview"
+  },
+  "build": {
+    "appId": "com.wind.client",
+    "productName": "Wind Client",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "!**/*",
+      "dist",
+      "dist/**",
+      "app-main",
+      "app-main/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../src/local-proxy.js",
+        "to": "proxy/local-proxy.js"
+      },
+      {
+        "from": "../src/connect-proto.js",
+        "to": "proxy/connect-proto.js"
+      },
+      {
+        "from": "../certs",
+        "to": "certs"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "lucide-react": "^0.575.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-router-dom": "^7.13.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.1",
+    "@tauri-apps/cli": "^2.10.0",
+    "@vitejs/plugin-react": "^5.1.4",
+    "autoprefixer": "^10.4.24",
+    "concurrently": "^9.2.1",
+    "electron": "^36.9.5",
+    "electron-builder": "^26.0.12",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.2.1",
+    "vite": "^7.3.1",
+    "wait-on": "^9.0.4"
+  }
+}

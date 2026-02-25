@@ -1,0 +1,4 @@
+subjectAltName=DNS:server.self-serve.windsurf.com
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
