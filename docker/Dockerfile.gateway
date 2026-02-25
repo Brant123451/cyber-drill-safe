@@ -1,0 +1,13 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package.json ./
+COPY src/ ./src/
+COPY .env.example ./.env.example
+
+RUN mkdir -p config logs run
+
+EXPOSE 18790
+
+CMD ["node", "src/lab-server.js"]

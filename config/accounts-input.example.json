@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "platform": "codeium",
+      "email": "user1@example.com",
+      "password": "your-password-here",
+      "headless": true
+    },
+    {
+      "platform": "codeium",
+      "email": "user2@example.com",
+      "password": "your-password-here",
+      "headless": true
+    },
+    {
+      "platform": "cursor",
+      "email": "user3@example.com",
+      "password": "your-password-here",
+      "headless": true
+    }
+  ]
+}

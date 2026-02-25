@@ -1,0 +1,62 @@
+version: "3.8"
+
+# =============================================================================
+# Cyber Drill Gateway - Docker Compose
+# 用法: docker compose up -d
+# =============================================================================
+
+services:
+  # ---- 网关核心 ----
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gateway
+    ports:
+      - "${GATEWAY_PORT:-18790}:18790"
+    volumes:
+      - ../config:/app/config
+      - ../logs:/app/logs
+      - ../run:/app/run
+    env_file:
+      - ../.env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:18790/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ---- Nginx 反向代理 ----
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  # ---- 会话容器模板 ----
+  # 每个账号一个容器，维持独立的浏览器 session
+  # 使用 docker compose run session-worker 启动
+  # 或通过 scripts/add-session-container.sh 批量创建
+  session-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.session
+    volumes:
+      - ../config:/app/config
+    environment:
+      - PLATFORM=${PLATFORM:-codeium}
+      - ACCOUNT_EMAIL=${ACCOUNT_EMAIL:-}
+      - ACCOUNT_PASSWORD=${ACCOUNT_PASSWORD:-}
+      - GATEWAY_URL=http://gateway:18790
+      - KEEPALIVE_INTERVAL_MS=300000
+    depends_on:
+      - gateway
+    profiles:
+      - session  # 不会随 docker compose up 自动启动
+    restart: unless-stopped

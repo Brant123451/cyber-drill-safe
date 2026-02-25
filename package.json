@@ -1,0 +1,35 @@
+{
+  "name": "cyber-drill-safe-lab",
+  "version": "1.0.0",
+  "description": "可部署的本地 LLM 网关（鉴权/配额/账号池/审计）",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup:ps": "powershell -ExecutionPolicy Bypass -File scripts/setup-gateway.ps1",
+    "deploy:ps": "powershell -ExecutionPolicy Bypass -File scripts/deploy-gateway.ps1",
+    "restart:ps": "powershell -ExecutionPolicy Bypass -File scripts/restart-gateway.ps1",
+    "start": "node src/lab-server.js",
+    "start:ps": "powershell -ExecutionPolicy Bypass -File scripts/start-gateway.ps1",
+    "smoke:ps": "powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1",
+    "accounts:status": "powershell -ExecutionPolicy Bypass -File scripts/account-pool.ps1 -Action status",
+    "accounts:reload": "powershell -ExecutionPolicy Bypass -File scripts/account-pool.ps1 -Action reload",
+    "accounts:check": "powershell -ExecutionPolicy Bypass -File scripts/account-pool.ps1 -Action check",
+    "client:setup": "powershell -ExecutionPolicy Bypass -File scripts/client-setup.ps1",
+    "client:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/client-setup.ps1 -Uninstall",
+    "openclaw:setup": "powershell -ExecutionPolicy Bypass -File scripts/openclaw-setup.ps1",
+    "users:status": "powershell -NoProfile -Command \"Invoke-RestMethod -Uri http://127.0.0.1:18790/admin/users/status | ConvertTo-Json -Depth 6\"",
+    "users:reload": "powershell -NoProfile -Command \"Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/users/reload | ConvertTo-Json -Depth 6\"",
+    "users:create": "powershell -NoProfile -Command \"$b=@{name=$args[0];creditLimit=1000}|ConvertTo-Json; Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/users/create -ContentType 'application/json' -Body $b | ConvertTo-Json -Depth 4\"",
+    "sessions:status": "powershell -NoProfile -Command \"Invoke-RestMethod -Uri http://127.0.0.1:18790/admin/sessions/status | ConvertTo-Json -Depth 6\"",
+    "sessions:reload": "powershell -NoProfile -Command \"Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/sessions/reload | ConvertTo-Json -Depth 6\"",
+    "sessions:health": "powershell -NoProfile -Command \"Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/sessions/health-check | ConvertTo-Json -Depth 6\"",
+    "automation:login": "node src/account-automation.js login",
+    "automation:batch": "node src/account-automation.js batch",
+    "automation:platforms": "node src/account-automation.js platforms",
+    "check": "node --check src/lab-server.js",
+    "reset": "powershell -NoProfile -Command \"Invoke-RestMethod -Method Post -Uri http://127.0.0.1:18790/admin/reset\""
+  }
+}

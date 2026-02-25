@@ -1,0 +1,25 @@
+{
+  "accounts": [
+    {
+      "id": "deepseek-main",
+      "dailyLimit": 100000,
+      "enabled": true,
+      "apiKey": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "baseUrl": "https://api.deepseek.com",
+      "healthcheckUrl": "https://api.deepseek.com/v1/models"
+    },
+    {
+      "id": "openai-backup",
+      "dailyLimit": 50000,
+      "enabled": true,
+      "apiKey": "sk-proj-yyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+      "baseUrl": "https://api.openai.com",
+      "healthcheckUrl": "https://api.openai.com/v1/models"
+    },
+    {
+      "id": "local-simulate",
+      "dailyLimit": 80000,
+      "enabled": true
+    }
+  ]
+}

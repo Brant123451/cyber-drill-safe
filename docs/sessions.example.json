@@ -1,0 +1,39 @@
+{
+  "sessions": [
+    {
+      "id": "codeium-user1",
+      "platform": "codeium",
+      "email": "user1@example.com",
+      "sessionToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example-token-1",
+      "refreshToken": null,
+      "deviceId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "dailyLimit": 100000,
+      "enabled": true,
+      "loginMethod": "email",
+      "acquiredAt": "2025-01-01T00:00:00Z",
+      "expiresAt": "2025-01-02T00:00:00Z",
+      "extra": {}
+    },
+    {
+      "id": "codeium-user2",
+      "platform": "codeium",
+      "email": "user2@example.com",
+      "sessionToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example-token-2",
+      "dailyLimit": 100000,
+      "enabled": true,
+      "loginMethod": "email",
+      "extra": {}
+    },
+    {
+      "id": "openai-backup",
+      "platform": "openai",
+      "sessionToken": "sk-proj-your-openai-api-key",
+      "dailyLimit": 50000,
+      "enabled": true,
+      "extra": {
+        "baseUrl": "https://api.openai.com"
+      }
+    }
+  ]
+}
