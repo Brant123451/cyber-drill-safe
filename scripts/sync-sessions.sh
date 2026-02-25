@@ -21,13 +21,15 @@ for a in accounts:
     sessions.append({
         'id': 'ws-' + a['email'].split('@')[0][:12],
         'platform': 'codeium',
-        'sessionToken': token,
+        'sessionToken': a.get('apiKey') or token,
         'email': a['email'],
         'label': a['email'],
         'enabled': True,
         'extra': {
             'apiKey': a.get('apiKey'),
             'firebaseIdToken': token,
+            'refreshToken': a.get('refreshToken'),
+            'password': a.get('password'),
             'uid': a.get('uid'),
         },
     })

@@ -134,6 +134,79 @@ try { sessionManager.load(); } catch (e) {
   console.log(`[lab] session pool not loaded: ${e.message}`);
 }
 
+// ---- Firebase Token 自动刷新 ----
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY";
+const TOKEN_REFRESH_INTERVAL_MS = Number(process.env.TOKEN_REFRESH_INTERVAL_MS ?? 45 * 60_000); // 45 min
+
+async function refreshFirebaseToken(session) {
+  const refreshToken = session.extra?.refreshToken;
+  if (!refreshToken) return false;
+
+  return new Promise((resolve) => {
+    const postData = JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+    });
+
+    const req = https.request({
+      hostname: "securetoken.googleapis.com",
+      port: 443,
+      path: `/v1/token?key=${FIREBASE_API_KEY}`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData),
+      },
+      timeout: 10_000,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          if (body.id_token) {
+            session.extra.firebaseIdToken = body.id_token;
+            if (body.refresh_token) session.extra.refreshToken = body.refresh_token;
+            console.log(`[token-refresh] ✓ ${session.id} token refreshed`);
+            resolve(true);
+          } else {
+            console.log(`[token-refresh] ✗ ${session.id} no id_token in response`);
+            resolve(false);
+          }
+        } catch (err) {
+          console.log(`[token-refresh] ✗ ${session.id} parse error: ${err.message}`);
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", (err) => {
+      console.log(`[token-refresh] ✗ ${session.id} request error: ${err.message}`);
+      resolve(false);
+    });
+    req.on("timeout", () => { req.destroy(); resolve(false); });
+    req.write(postData);
+    req.end();
+  });
+}
+
+async function refreshAllTokens() {
+  let refreshed = 0;
+  for (const session of sessionManager.sessions) {
+    if (!session.extra?.refreshToken) continue;
+    const ok = await refreshFirebaseToken(session);
+    if (ok) refreshed++;
+    await new Promise((r) => setTimeout(r, 1000)); // 1s delay between refreshes
+  }
+  if (refreshed > 0) {
+    sessionManager.save();
+    console.log(`[token-refresh] saved ${refreshed} refreshed tokens`);
+  }
+}
+
+// Initial refresh on startup + periodic refresh
+setTimeout(() => refreshAllTokens(), 5_000);
+setInterval(() => refreshAllTokens(), TOKEN_REFRESH_INTERVAL_MS);
+
 const requestTimeline = new Map();
 const events = [];
 
