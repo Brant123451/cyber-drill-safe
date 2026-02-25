@@ -40,6 +40,22 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 
+// 加载 .env 文件
+function loadEnvFile(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const raw = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
+  for (const line of raw.split(/\r?\n/)) {
+    const text = line.trim();
+    if (!text || text.startsWith("#")) continue;
+    const eqIdx = text.indexOf("=");
+    if (eqIdx < 0) continue;
+    const key = text.substring(0, eqIdx).trim();
+    const val = text.substring(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = val;
+  }
+}
+loadEnvFile(path.join(PROJECT_ROOT, ".env"));
+
 // ============================================================
 // 配置
 // ============================================================
@@ -1397,21 +1413,32 @@ async function registerViaCodeium(identity, options = {}) {
 
     // 如果有 token，调用 RegisterUser RPC 获取 API Key
     if (capturedToken && !capturedApiKey) {
-      try {
-        console.log("[codeium]   → 调用 RegisterUser RPC...");
-        const regReq = encodeRegisterUserRequest(capturedToken);
-        const regRes = await callConnectRpc(CONFIG.registerServer, CONFIG.rpcRegisterUser, regReq);
-        if (regRes.status === 200) {
-          const frames = parseConnectFrames(regRes.body);
-          if (frames.length > 0) {
-            const fields = extractStringsFromProtobuf(frames[0].data);
-            result.apiKey = fields.find(f => f.field === 1)?.value;
-            result.apiServerUrl = fields.find(f => f.field === 3)?.value;
-            console.log(`[codeium]   ✓ API Key: ${result.apiKey?.substring(0, 20)}...`);
+      const rpcEndpoints = [
+        { base: CONFIG.registerServer, path: CONFIG.rpcRegisterUser },
+        { base: "https://server.codeium.com", path: "/exa.seat_management_pb.SeatManagementService/RegisterUser" },
+      ];
+      for (const ep of rpcEndpoints) {
+        if (result.apiKey) break;
+        try {
+          console.log(`[codeium]   → RegisterUser RPC: ${ep.base}${ep.path}`);
+          const regReq = encodeRegisterUserRequest(capturedToken);
+          const regRes = await callConnectRpc(ep.base, ep.path, regReq);
+          console.log(`[codeium]     status=${regRes.status}, body=${regRes.body.length}B`);
+          if (regRes.status === 200 && regRes.body.length > 5) {
+            const frames = parseConnectFrames(regRes.body);
+            if (frames.length > 0) {
+              const fields = extractStringsFromProtobuf(frames[0].data);
+              console.log(`[codeium]     fields: ${fields.map(f => `f${f.field}=${f.value?.substring(0,25)}`).join(", ")}`);
+              result.apiKey = fields.find(f => f.field === 1)?.value;
+              result.apiServerUrl = fields.find(f => f.field === 3)?.value;
+              if (result.apiKey) {
+                console.log(`[codeium]   ✓ API Key: ${result.apiKey.substring(0, 30)}...`);
+              }
+            }
           }
+        } catch (err) {
+          console.log(`[codeium]   ✗ ${ep.base} error: ${err.message}`);
         }
-      } catch (err) {
-        console.log(`[codeium]   ✗ RegisterUser error: ${err.message}`);
       }
     }
 
@@ -2534,7 +2561,49 @@ async function registerViaPuppeteer(identity, options = {}) {
 }
 
 // ============================================================
-// 账号池管理
+// 文件锁（并行安全）
+// ============================================================
+
+const _fileLocks = new Map();
+
+async function withFileLock(filePath, fn) {
+  const lockPath = filePath + ".lock";
+  const maxWait = 10_000;
+  const start = Date.now();
+
+  // 进程内互斥
+  while (_fileLocks.get(lockPath)) {
+    await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
+    if (Date.now() - start > maxWait) throw new Error(`Lock timeout (in-process): ${lockPath}`);
+  }
+  _fileLocks.set(lockPath, true);
+
+  // 文件系统互斥（跨进程）
+  while (true) {
+    try {
+      fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+      break;
+    } catch {
+      if (Date.now() - start > maxWait) {
+        // 超时强制清锁（可能是遗留的死锁）
+        try { fs.unlinkSync(lockPath); } catch {}
+        fs.writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+        break;
+      }
+      await new Promise(r => setTimeout(r, 50 + Math.random() * 200));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try { fs.unlinkSync(lockPath); } catch {}
+    _fileLocks.delete(lockPath);
+  }
+}
+
+// ============================================================
+// 账号池管理（带文件锁）
 // ============================================================
 
 function loadAccounts() {
@@ -2550,52 +2619,55 @@ function saveAccounts(data) {
   fs.writeFileSync(CONFIG.accountsFile, JSON.stringify(data, null, 2), "utf8");
 }
 
-function addAccount(account) {
-  const data = loadAccounts();
-  // 去重
-  const existing = data.accounts.findIndex((a) => a.email === account.email);
-  if (existing >= 0) {
-    data.accounts[existing] = account;
-  } else {
-    data.accounts.push(account);
-  }
-  saveAccounts(data);
-  return data;
+async function addAccount(account) {
+  return withFileLock(CONFIG.accountsFile, () => {
+    const data = loadAccounts();
+    const existing = data.accounts.findIndex((a) => a.email === account.email);
+    if (existing >= 0) {
+      data.accounts[existing] = account;
+    } else {
+      data.accounts.push(account);
+    }
+    saveAccounts(data);
+    return data;
+  });
 }
 
 /**
  * 将注册的账号同步到 sessions.json（供 lab-server 使用）
  */
-function syncToSessions(account) {
+async function syncToSessions(account) {
   if (!account.apiKey && !account.firebaseIdToken) return;
 
   const sessionsFile = CONFIG.sessionsFile;
-  let sessions = { sessions: [] };
-  if (fs.existsSync(sessionsFile)) {
-    sessions = JSON.parse(fs.readFileSync(sessionsFile, "utf8"));
-    if (Array.isArray(sessions)) sessions = { sessions };
-  }
+  await withFileLock(sessionsFile, () => {
+    let sessions = { sessions: [] };
+    if (fs.existsSync(sessionsFile)) {
+      sessions = JSON.parse(fs.readFileSync(sessionsFile, "utf8"));
+      if (Array.isArray(sessions)) sessions = { sessions };
+    }
 
-  const sessionEntry = {
-    id: `ws-trial-${account.email.split("@")[0].substring(0, 8)}`,
-    platform: "windsurf",
-    email: account.email,
-    sessionToken: account.apiKey || account.firebaseIdToken,
-    enabled: account.status === "registered",
-    loginMethod: "trial-auto",
-    acquiredAt: account.registeredAt,
-    expiresAt: account.expiresAt,
-  };
+    const sessionEntry = {
+      id: `ws-trial-${account.email.split("@")[0].substring(0, 8)}`,
+      platform: "windsurf",
+      email: account.email,
+      sessionToken: account.apiKey || account.firebaseIdToken,
+      enabled: account.status === "registered",
+      loginMethod: "trial-auto",
+      acquiredAt: account.registeredAt,
+      expiresAt: account.expiresAt,
+    };
 
-  const idx = sessions.sessions.findIndex((s) => s.email === account.email);
-  if (idx >= 0) {
-    sessions.sessions[idx] = sessionEntry;
-  } else {
-    sessions.sessions.push(sessionEntry);
-  }
+    const idx = sessions.sessions.findIndex((s) => s.email === account.email);
+    if (idx >= 0) {
+      sessions.sessions[idx] = sessionEntry;
+    } else {
+      sessions.sessions.push(sessionEntry);
+    }
 
-  fs.writeFileSync(sessionsFile, JSON.stringify(sessions, null, 2), "utf8");
-  console.log(`[registrar] ✓ 已同步到 ${sessionsFile}`);
+    fs.writeFileSync(sessionsFile, JSON.stringify(sessions, null, 2), "utf8");
+    console.log(`[registrar] ✓ 已同步到 ${sessionsFile}`);
+  });
 }
 
 // ============================================================
@@ -2912,9 +2984,9 @@ async function main() {
         });
       }
 
-      addAccount(result);
+      await addAccount(result);
       if (result.status === "registered" || result.status === "registered_no_token") {
-        syncToSessions(result);
+        await syncToSessions(result);
       }
 
       console.log();
@@ -2933,53 +3005,170 @@ async function main() {
 
     case "batch": {
       const count = parseInt(getArg("count", "3"));
-      const delay = parseInt(getArg("delay", "15")); // 每个账号间隔秒数
+      const delay = parseInt(getArg("delay", "15"));
+      const parallel = parseInt(getArg("parallel", "1"));
       const headful = getFlag("headful");
+      const mode = getArg("mode", "codeium");
+      const maxRetries = parseInt(getArg("retries", "1"));
 
-      console.log("[registrar] ═══════════════════════════════════════");
-      console.log(`[registrar] 批量注册: ${count} 个账号`);
-      console.log(`[registrar] 间隔: ${delay} 秒`);
-      console.log("[registrar] ═══════════════════════════════════════");
+      console.log("[batch] ═══════════════════════════════════════");
+      console.log(`[batch] 批量注册: ${count} 个账号`);
+      console.log(`[batch] 模式: ${mode} | 并行: ${parallel} | 间隔: ${delay}s | 重试: ${maxRetries}`);
+      console.log(`[batch] IMAP: ${CONFIG.imapUser || "未配置"}`);
+      console.log(`[batch] Catch-all: ${CATCHALL_DOMAIN || "未配置"}`);
+      console.log("[batch] ═══════════════════════════════════════");
 
-      const results = { success: [], failed: [] };
+      const results = { success: [], failed: [], noApiKey: [] };
+      const startTime = Date.now();
+      let completed = 0;
 
-      for (let i = 0; i < count; i++) {
-        console.log(`\n[registrar] ──── ${i + 1}/${count} ────`);
+      // 单个账号注册+后处理的完整流程
+      async function registerOneAccount(taskIndex) {
+        const wk = `[W${taskIndex % parallel}]`;
+        console.log(`\n${wk} ════ ${taskIndex + 1}/${count} ════`);
+
+        // 随机交错启动延迟（避免同时访问）
+        if (parallel > 1 && taskIndex >= parallel) {
+          const jitter = delay * 1000 + Math.random() * 5000;
+          console.log(`${wk} 等待 ${(jitter / 1000).toFixed(1)} 秒...`);
+          await new Promise((r) => setTimeout(r, jitter));
+        } else if (parallel > 1 && taskIndex > 0) {
+          // 首批 worker 之间加 3-8 秒交错
+          const stagger = 3000 + Math.random() * 5000;
+          await new Promise((r) => setTimeout(r, stagger));
+        }
+
         const identity = await generateIdentity(true);
+        console.log(`${wk} 邮箱: ${identity.email}`);
 
-        try {
-          const result = await registerViaPuppeteer(identity, {
-            headless: !headful,
-          });
-          addAccount(result);
-          if (result.status === "registered") {
-            syncToSessions(result);
-            results.success.push(result.email);
+        let result = null;
+        let lastErr = null;
+
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+          if (attempt > 0) {
+            console.log(`${wk}   重试 ${attempt}/${maxRetries}...`);
+            await new Promise((r) => setTimeout(r, 5000));
+          }
+
+          try {
+            if (mode === "codeium") {
+              result = await registerViaCodeium(identity, { headless: !headful });
+            } else {
+              result = await registerViaPuppeteer(identity, { headless: !headful });
+            }
+            if (result && (result.status === "registered" || result.status === "registered_no_token")) {
+              break;
+            }
+            lastErr = result?.status || "unknown";
+          } catch (err) {
+            lastErr = err.message;
+            console.error(`${wk}   ✗ 错误: ${err.message}`);
+          }
+        }
+
+        if (result) {
+          await addAccount(result);
+
+          // apiKey 补获取
+          if (result.firebaseIdToken && !result.apiKey) {
+            console.log(`${wk}   → 补获取 apiKey...`);
+            const endpoints = [
+              { base: CONFIG.registerServer, path: CONFIG.rpcRegisterUser },
+              { base: "https://server.codeium.com", path: "/exa.seat_management_pb.SeatManagementService/RegisterUser" },
+            ];
+            for (const ep of endpoints) {
+              if (result.apiKey) break;
+              try {
+                const regReq = encodeRegisterUserRequest(result.firebaseIdToken);
+                const regRes = await callConnectRpc(ep.base, ep.path, regReq);
+                console.log(`${wk}     ${ep.base} → ${regRes.status} (${regRes.body.length}B)`);
+                if (regRes.status === 200 && regRes.body.length > 5) {
+                  const frames = parseConnectFrames(regRes.body);
+                  if (frames.length > 0) {
+                    const strings = extractStringsFromProtobuf(frames[0].data);
+                    const key = strings.find(s => s.value && s.value.length > 20 && !s.value.includes(" "));
+                    if (key) {
+                      result.apiKey = key.value;
+                      await addAccount(result);
+                      console.log(`${wk}   ✓ apiKey: ${result.apiKey.substring(0, 30)}...`);
+                    }
+                  }
+                }
+              } catch (err) {
+                console.log(`${wk}     ✗ ${ep.base}: ${err.message}`);
+              }
+            }
+          }
+
+          if (result.status === "registered" || result.status === "registered_no_token") {
+            await syncToSessions(result);
+            if (result.apiKey) {
+              results.success.push(result.email);
+            } else {
+              results.noApiKey.push(result.email);
+            }
           } else {
             results.failed.push({ email: result.email, reason: result.status });
           }
-        } catch (err) {
-          console.error(`[registrar] ✗ 失败: ${err.message}`);
-          results.failed.push({ email: identity.email, reason: err.message });
+        } else {
+          results.failed.push({ email: identity.email, reason: lastErr || "all retries failed" });
         }
 
-        if (i < count - 1) {
-          const jitter = delay * 1000 + Math.random() * 5000;
-          console.log(`[registrar] 等待 ${(jitter / 1000).toFixed(1)} 秒...`);
-          await new Promise((r) => setTimeout(r, jitter));
-        }
+        completed++;
+        const pct = ((completed / count) * 100).toFixed(0);
+        const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+        console.log(`${wk} ── 进度: ${completed}/${count} (${pct}%) | 成功:${results.success.length} 无key:${results.noApiKey.length} 失败:${results.failed.length} | ${elapsed}min`);
       }
 
+      if (parallel <= 1) {
+        // 串行模式
+        for (let i = 0; i < count; i++) {
+          await registerOneAccount(i);
+          if (i < count - 1) {
+            const jitter = delay * 1000 + Math.random() * 5000;
+            console.log(`[batch] 等待 ${(jitter / 1000).toFixed(1)} 秒...`);
+            await new Promise((r) => setTimeout(r, jitter));
+          }
+        }
+      } else {
+        // 并行模式：worker pool
+        const queue = Array.from({ length: count }, (_, i) => i);
+        const workers = [];
+
+        for (let w = 0; w < Math.min(parallel, count); w++) {
+          workers.push((async () => {
+            while (queue.length > 0) {
+              const taskIndex = queue.shift();
+              if (taskIndex === undefined) break;
+              try {
+                await registerOneAccount(taskIndex);
+              } catch (err) {
+                console.error(`[W${w}] 未捕获错误: ${err.message}`);
+                results.failed.push({ email: `task-${taskIndex}`, reason: err.message });
+                completed++;
+              }
+            }
+          })());
+        }
+
+        await Promise.all(workers);
+      }
+
+      const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+
       console.log();
-      console.log("[registrar] ═══════════════════════════════════════");
-      console.log(`[registrar] 完成: ${results.success.length} 成功, ${results.failed.length} 失败`);
+      console.log("[batch] ═══════════════════════════════════════");
+      console.log(`[batch] 完成! 耗时 ${elapsed} 分钟 (${parallel} 并行)`);
+      console.log(`[batch]   ✓ 完整成功 (有apiKey): ${results.success.length}`);
+      console.log(`[batch]   △ 注册成功 (无apiKey): ${results.noApiKey.length}`);
+      console.log(`[batch]   ✗ 失败: ${results.failed.length}`);
       if (results.failed.length > 0) {
-        console.log("[registrar] 失败列表:");
+        console.log("[batch] 失败列表:");
         for (const f of results.failed) {
           console.log(`  - ${f.email}: ${f.reason}`);
         }
       }
-      console.log("[registrar] ═══════════════════════════════════════");
+      console.log("[batch] ═══════════════════════════════════════");
       break;
     }
 
@@ -3047,7 +3236,7 @@ async function main() {
           data.accounts[idx].status = result.apiKey ? "registered" : data.accounts[idx].status;
           saveAccounts(data);
         }
-        syncToSessions(result);
+        await syncToSessions(result);
 
         console.log("[login] ═══════════════════════════════════════");
         console.log(`[login] 结果: ${result.apiKey ? "成功" : "仅获取 Token"}`);
@@ -3092,7 +3281,7 @@ async function main() {
             acc.apiKey = result.apiKey;
             acc.status = result.apiKey ? "registered" : acc.status;
             saveAccounts(data);
-            syncToSessions({ ...acc, ...result });
+            await syncToSessions({ ...acc, ...result });
             success++;
             console.log(`[batch-login]   ✓ ${result.apiKey ? "API Key 获取成功" : "仅 Token"}`);
           } else {
