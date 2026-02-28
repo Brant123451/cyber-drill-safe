@@ -5754,37 +5754,78 @@ async function submitStripePayment(page, screenshotDir) {
     console.log(`${prefix}   → 检测到 hCaptcha!`);
     await page.screenshot({ path: path.join(screenshotDir, `stripe-hcaptcha-${Date.now()}.png`), fullPage: true });
 
-    // 方式 1：CDP 扫射点击 hCaptcha checkbox（视口中心偏左区域）
+    // 方式 1：CDP 深度搜索 DOM，精确定位 hCaptcha checkbox 并点击
     let hcaptchaSolved = false;
     try {
+      await new Promise(r => setTimeout(r, 2000)); // 等 hCaptcha iframe 加载
       const client = await page.createCDPSession();
-      const vp = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
-      const centerX = vp.w / 2;
-      const centerY = vp.h / 2;
+      const { root } = await client.send("DOM.getDocument", { depth: -1, pierce: true });
 
-      // hCaptcha 弹窗居中，checkbox 在弹窗左侧
-      const sweepPoints = [];
-      for (let y = centerY - 30; y <= centerY + 30; y += 15) {
-        for (let x = centerX - 150; x <= centerX - 80; x += 15) {
-          sweepPoints.push({ x, y });
+      // 递归搜索所有嵌套 iframe/shadow DOM，找 checkbox
+      const hits = [];
+      async function deepFind(node) {
+        const tag = node.nodeName;
+        const attrs = node.attributes || [];
+        let id = "", cls = "", src = "", role = "";
+        for (let i = 0; i < attrs.length; i += 2) {
+          if (attrs[i] === "id") id = attrs[i + 1];
+          if (attrs[i] === "class") cls = attrs[i + 1];
+          if (attrs[i] === "src") src = attrs[i + 1];
+          if (attrs[i] === "role") role = attrs[i + 1];
         }
+        const isTarget = id.includes("checkbox") || role === "checkbox" || cls.includes("checkbox");
+        const isHcIframe = tag === "IFRAME" && src.includes("hcaptcha");
+        if (isTarget || isHcIframe) {
+          try {
+            const { model } = await client.send("DOM.getBoxModel", { nodeId: node.nodeId });
+            const c = model.content;
+            const box = { x: c[0], y: c[1], w: c[2] - c[0], h: c[5] - c[1] };
+            if (box.w > 0 && box.h > 0) {
+              hits.push({ tag, id, role, src: src.substring(0, 60), box });
+            }
+          } catch {}
+        }
+        for (const child of (node.children || [])) await deepFind(child);
+        for (const sr of (node.shadowRoots || [])) {
+          for (const child of (sr.children || [])) await deepFind(child);
+        }
+        if (node.contentDocument) await deepFind(node.contentDocument);
       }
-      console.log(`${prefix}   → CDP 扫射点击 hCaptcha checkbox (${sweepPoints.length} 点)...`);
-      for (const pt of sweepPoints) {
-        await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y });
-        await new Promise(r => setTimeout(r, 10));
-        await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: pt.x, y: pt.y, button: "left", clickCount: 1 });
-        await new Promise(r => setTimeout(r, 10));
-        await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", clickCount: 1 });
+
+      console.log(`${prefix}   → CDP 深度搜索 hCaptcha checkbox...`);
+      await deepFind(root);
+      console.log(`${prefix}   找到 ${hits.length} 个匹配元素:`);
+      for (const h of hits) {
+        console.log(`${prefix}     <${h.tag}> id=${h.id} role=${h.role} ${h.box.w.toFixed(0)}x${h.box.h.toFixed(0)} at(${h.box.x.toFixed(0)},${h.box.y.toFixed(0)}) src=${h.src}`);
       }
-      console.log(`${prefix}   ✓ CDP 扫射完成`);
+
+      // 优先非 iframe 的 checkbox，其次小尺寸 hcaptcha iframe
+      let target = hits.find(h => h.tag !== "IFRAME" && (h.id.includes("checkbox") || h.role === "checkbox"));
+      if (!target) target = hits.find(h => h.tag === "IFRAME" && h.src.includes("hcaptcha") && h.box.w < 500 && h.box.h < 200);
+      if (!target && hits.length > 0) target = hits[0];
+
+      if (target) {
+        const cx = target.box.x + target.box.w / 2;
+        const cy = target.box.y + target.box.h / 2;
+        console.log(`${prefix}   → 精确点击 (${cx.toFixed(0)}, ${cy.toFixed(0)})...`);
+        await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+        await new Promise(r => setTimeout(r, 100));
+        await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+        await new Promise(r => setTimeout(r, 50));
+        await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+        console.log(`${prefix}   ✓ 已点击`);
+      } else {
+        console.log(`${prefix}   ✗ 未找到 checkbox 元素`);
+      }
+
       await client.detach();
 
-      // 等 5s 看是否自动通过
+      // 等 5s 看是否通过
       await new Promise(r => setTimeout(r, 5000));
       const stillHc = await page.evaluate(() => {
         const text = document.body?.innerText || "";
         return text.includes("I am human") || text.includes("One more step") ||
+          text.includes("真实访客") || text.includes("还需一步") ||
           document.querySelector('iframe[src*="hcaptcha"]') !== null;
       });
       if (!stillHc || !page.url().includes("stripe")) {
@@ -5792,7 +5833,7 @@ async function submitStripePayment(page, screenshotDir) {
         console.log(`${prefix}   ✓ hCaptcha 已通过!`);
       }
     } catch (e) {
-      console.log(`${prefix}   CDP 扫射失败: ${e.message}`);
+      console.log(`${prefix}   CDP 精确点击失败: ${e.message}`);
     }
 
     // 方式 2：暂停等待手动点击（通过 SSH 隧道 + edge://inspect）
