@@ -6593,14 +6593,15 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
   await page.goto(referralUrl, { waitUntil: "networkidle2", timeout: 60000 });
   await new Promise(r => setTimeout(r, 5000));
 
-  await page.screenshot({ path: path.join(screenshotDir, `referral-accept-1-loaded-${Date.now()}.png`), fullPage: true });
+  await page.screenshot({ path: path.join(screenshotDir, `referral-1-loaded-${Date.now()}.png`), fullPage: true });
 
-  // 检查是否有错误（已经是付费用户）
+  // 检查页面状态
   const pageCheck = await page.evaluate(() => {
     const text = (document.body?.innerText || "").toLowerCase();
     if (text.includes("already on a paid") || text.includes("ineligible")) return { error: "already_paid" };
     if (text.includes("invalid") || text.includes("expired")) return { error: "invalid_code" };
-    return { error: null, text: text.substring(0, 500) };
+    if (text.includes("referral activated")) return { error: null, alreadyActivated: true, text: text.substring(0, 300) };
+    return { error: null, alreadyActivated: false, text: text.substring(0, 300) };
   });
 
   if (pageCheck.error === "already_paid") {
@@ -6614,43 +6615,41 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
 
   console.log(`${prefix}   页面状态: ${(pageCheck.text || "").substring(0, 200)}`);
 
-  // 关闭 Cookie 弹窗（如果有）—— 仅匹配 cookie/consent 相关弹窗
+  // 如果已经是 "Referral Activated"，直接成功
+  if (pageCheck.alreadyActivated) {
+    console.log(`${prefix}   ✓ 推荐已激活（之前已接受过）`);
+    await page.screenshot({ path: path.join(screenshotDir, `referral-2-activated-${Date.now()}.png`), fullPage: true });
+    return { success: true };
+  }
+
+  // 关闭 Cookie 弹窗（如果有）
   await page.evaluate(() => {
     const cookieBtns = [...document.querySelectorAll("button")].filter(b => {
       const t = (b.textContent || "").trim().toLowerCase();
-      // 必须是 cookie/consent 弹窗的按钮
       const parent = b.closest('[class*="cookie"], [class*="consent"], [class*="banner"], [id*="cookie"], [id*="consent"]');
-      return (t === "accept all" || t === "accept" || t === "got it" || t === "ok") &&
+      return (t === "accept all" || t === "got it" || t === "ok") &&
         b.offsetParent !== null && (parent || t === "accept all");
     });
     for (const btn of cookieBtns) btn.click();
   });
   await new Promise(r => setTimeout(r, 1000));
 
-  // 点击 "Accept referral" / "Start Pro Trial" / "Get Started" / "Claim" 按钮
-  console.log(`${prefix} → 点击接受推荐按钮...`);
+  // 点击 "Accept referral" 按钮
+  console.log(`${prefix} → 点击 Accept referral...`);
   const clickResult = await page.evaluate(() => {
     const allEls = [...document.querySelectorAll("button, a, [role='button'], [class*='button'], [class*='btn'], [class*='cta']")];
-    // 排除 cookie/consent 弹窗元素
     const filtered = allEls.filter(e => {
       const t = (e.textContent || "").toLowerCase().trim();
       if (t.includes("reject") || t.includes("manage") || t.includes("preferences") || t.includes("cookie")) return false;
-      if (t === "accept all") return false; // cookie banner
+      if (t === "accept all") return false;
       return e.offsetParent !== null && !e.disabled;
     });
-    const priorities = [
-      "accept referral", "claim", "accept",
-      "get started", "start free trial", "start trial",
-      "select plan", "try pro", "upgrade", "continue", "start",
-    ];
+    // 只找 "accept referral" 或 "accept"
+    const priorities = ["accept referral", "claim", "accept"];
     for (const keyword of priorities) {
-      const el = filtered.find(e => {
-        const t = (e.textContent || "").toLowerCase().trim();
-        return t.includes(keyword);
-      });
+      const el = filtered.find(e => (e.textContent || "").toLowerCase().trim().includes(keyword));
       if (el) {
-        if (el.href) location.href = el.href;
-        else el.click();
+        el.click();
         return { clicked: (el.textContent || "").trim().substring(0, 50), keyword };
       }
     }
@@ -6658,139 +6657,53 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
   });
 
   if (!clickResult) {
-    console.log(`${prefix}   ⚠ 未找到明显的接受按钮，尝试继续...`);
-  } else {
-    console.log(`${prefix}   ✓ 点击: "${clickResult.clicked}" (keyword: ${clickResult.keyword})`);
+    console.log(`${prefix}   ✗ 未找到 Accept referral 按钮`);
+    await page.screenshot({ path: path.join(screenshotDir, `referral-2-no-button-${Date.now()}.png`), fullPage: true });
+    return { success: false, error: "no_accept_button" };
   }
+  console.log(`${prefix}   ✓ 点击: "${clickResult.clicked}"`);
 
-  // 等待页面响应（可能出现 "Referral Activated" 中间页）
-  await new Promise(r => setTimeout(r, 3000));
-
-  const activatedPage = await page.evaluate(() => {
-    const text = (document.body?.innerText || "").toLowerCase();
-    return text.includes("referral activated") || text.includes("referral from");
-  });
-
-  if (activatedPage) {
-    console.log(`${prefix}   → 检测到 "Referral Activated" 页面，点击 View plans...`);
-    await page.screenshot({ path: path.join(screenshotDir, `referral-activated-${Date.now()}.png`), fullPage: true });
-
-    const viewPlansClicked = await page.evaluate(() => {
-      const allEls = [...document.querySelectorAll("button, a, [role='button']")];
-      const keywords = ["view plans", "view plan", "see plans", "subscribe", "start trial", "get started", "upgrade"];
-      for (const kw of keywords) {
-        const el = allEls.find(e => {
-          const t = (e.textContent || "").toLowerCase().trim();
-          return t.includes(kw) && e.offsetParent !== null;
-        });
-        if (el) {
-          if (el.href) location.href = el.href;
-          else el.click();
-          return (el.textContent || "").trim().substring(0, 40);
-        }
-      }
-      return null;
-    });
-
-    if (viewPlansClicked) {
-      console.log(`${prefix}   ✓ 点击: "${viewPlansClicked}"`);
-      await new Promise(r => setTimeout(r, 3000));
-      const pricingUrl = page.url();
-      console.log(`${prefix}   URL: ${pricingUrl}`);
-
-      // 到了 pricing 页面 → 直接复用 activateProTrialOnPage 的完整流程
-      if (pricingUrl.includes("pricing") || pricingUrl.includes("windsurf.com")) {
-        console.log(`${prefix}   → 进入 pricing 页面，调用 activateProTrialOnPage 处理...`);
-        page._trialEmail = page._trialEmail || ""; // 确保邮件确认可用
-        return await activateProTrialOnPage(page, vcc, screenshotDir);
-      }
-    } else {
-      console.log(`${prefix}   ⚠ 未找到 View plans 按钮`);
-    }
-  }
-
-  // 如果没进 pricing 页面，走原有的 Stripe 检测逻辑
-  // 等待 Turnstile（如果有）
-  console.log(`${prefix} → 等待 Turnstile CAPTCHA...`);
-  for (let i = 0; i < 15; i++) {
-    const turnstile = await page.evaluate(() => {
-      const text = document.body?.innerText || "";
-      if (text.includes("Success!")) return "success";
-      if (text.includes("Verifying")) return "verifying";
-      const hasWidget = !!document.querySelector('iframe[src*="turnstile"], .cf-turnstile');
-      return hasWidget ? "widget_present" : "none";
-    });
-    if (turnstile === "success" || turnstile === "none") break;
-    console.log(`${prefix}   Turnstile: ${turnstile} (${i + 1}/15)`);
-    await new Promise(r => setTimeout(r, 2000));
-  }
-
-  // 点击 Continue（模态框中的）
-  const continueClicked = await page.evaluate(() => {
-    const btns = [...document.querySelectorAll("button")];
-    const btn = btns.find(b => {
-      const t = (b.textContent || "").trim().toLowerCase();
-      return t === "continue" && b.offsetParent !== null && !b.disabled;
-    });
-    if (btn) { btn.click(); return true; }
-    return false;
-  });
-  if (continueClicked) console.log(`${prefix}   ✓ Continue 已点击`);
-
-  // 等待 Stripe Checkout
-  console.log(`${prefix} → 等待 Stripe Checkout...`);
+  // 等待页面响应
   await new Promise(r => setTimeout(r, 5000));
-  await page.screenshot({ path: path.join(screenshotDir, `referral-accept-2-checkout-${Date.now()}.png`), fullPage: true });
+  await page.screenshot({ path: path.join(screenshotDir, `referral-2-after-accept-${Date.now()}.png`), fullPage: true });
 
-  const currentUrl = page.url();
-  console.log(`${prefix}   URL: ${currentUrl}`);
-
-  const isStripeCheckout = currentUrl.includes("checkout.stripe.com");
-  const hasStripeEmbed = await page.evaluate(() => {
-    return document.querySelectorAll('iframe[src*="stripe"], iframe[name*="stripe"]').length > 0
-      || document.querySelector('[class*="StripeElement"], #payment-element, [data-stripe]') !== null;
+  // 检查是否出现 "Referral Activated"
+  const activated = await page.evaluate(() => {
+    const text = (document.body?.innerText || "").toLowerCase();
+    return text.includes("referral activated") || text.includes("referral from") || text.includes("accepted");
   });
 
-  if (isStripeCheckout) {
-    return await fillStripeCheckoutPage(page, vcc, screenshotDir);
-  } else if (hasStripeEmbed) {
-    return await fillStripeEmbedded(page, vcc, screenshotDir);
+  if (activated) {
+    console.log(`${prefix}   ✓ 推荐已激活! (Referral Activated)`);
+    return { success: true };
   }
 
-  // 可能还需等待跳转
-  for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    const url = page.url();
-    if (url.includes("stripe") || url.includes("checkout") || url.includes("billing")) {
-      console.log(`${prefix}   → 跳转到: ${url}`);
-      await new Promise(r => setTimeout(r, 3000));
-      if (url.includes("checkout.stripe.com")) {
-        return await fillStripeCheckoutPage(page, vcc, screenshotDir);
-      }
-      const hasEmbed = await page.evaluate(() =>
-        document.querySelectorAll('iframe[src*="stripe"]').length > 0 ||
-        document.querySelector('[class*="StripeElement"]') !== null
-      );
-      if (hasEmbed) return await fillStripeEmbedded(page, vcc, screenshotDir);
-      break;
-    }
-    // 检查是否已成功（有些情况下绑卡后直接跳回）
-    const pageText = await page.evaluate(() => (document.body?.innerText || "").toLowerCase());
-    if (pageText.includes("success") || pageText.includes("welcome to pro") || pageText.includes("trial activated")) {
-      console.log(`${prefix}   ✓ 推荐接受成功！`);
-      return { success: true };
-    }
+  // 如果页面没显示 activated，再等几秒重试检查
+  await new Promise(r => setTimeout(r, 5000));
+  const activated2 = await page.evaluate(() => {
+    const text = (document.body?.innerText || "").toLowerCase();
+    return text.includes("referral activated") || text.includes("referral from") || text.includes("accepted");
+  });
+
+  if (activated2) {
+    console.log(`${prefix}   ✓ 推荐已激活! (延迟确认)`);
+    await page.screenshot({ path: path.join(screenshotDir, `referral-3-activated-${Date.now()}.png`), fullPage: true });
+    return { success: true };
   }
 
-  await page.screenshot({ path: path.join(screenshotDir, `referral-accept-3-unknown-${Date.now()}.png`), fullPage: true });
-  return { success: false, error: "no_stripe_page", url: page.url() };
+  // 最终截图
+  await page.screenshot({ path: path.join(screenshotDir, `referral-3-unknown-${Date.now()}.png`), fullPage: true });
+  const finalText = await page.evaluate(() => (document.body?.innerText || "").substring(0, 300));
+  console.log(`${prefix}   ⚠ 状态不确定: ${finalText.substring(0, 150)}`);
+  return { success: false, error: "uncertain_status" };
 }
 
 /**
  * 完整邀请推荐流程
  * 1. 登录推荐人（已有 Pro Trial 账号） → 提取 referral code
- * 2. 注册新 Free 账号
- * 3. 新账号登录 → 打开推荐链接 → 绑 VCC → 双方获得 +250 credits
+ * 2. 从 free 池选取已注册账号
+ * 3. 新账号登录 → 打开推荐链接 → 点击 Accept referral → 完成
+ * 注：250 积分在被推荐人之后订阅 Pro 时发放（用 activate-trial 命令）
  */
 async function referralFlow(referrerAccount, vcc, options = {}) {
   const { headless = true, skipRegister = false, newAccountEmail = null } = options;
@@ -6959,6 +6872,9 @@ async function referralFlow(referrerAccount, vcc, options = {}) {
     fingerprint: true,
   });
 
+  // 传递邮箱给 page2，供 IMAP 邮件确认兜底使用
+  page2._trialEmail = newAccount.email;
+
   let capturedToken = null;
   let capturedApiKey = null;
 
@@ -7029,22 +6945,17 @@ async function referralFlow(referrerAccount, vcc, options = {}) {
     const result = await acceptReferralOnPage(page2, referralCode, vcc, screenshotDir);
 
     if (result.success) {
-      markVccUsed(vcc, newAccount.email);
-
-      // 更新新账号状态
+      // 记录推荐关系（不改 status，不标记 VCC）
+      // status 仍为 registered，需之后单独 activate-trial 才变 pro_trial 并触发 250 积分
       const data = loadAccounts();
       const acct = data.accounts.find(a => a.email === newAccount.email);
       if (acct) {
-        acct.status = "pro_trial";
         acct.referredBy = referrerAccount.email;
         acct.referralCode = referralCode;
-        acct.trialActivatedAt = new Date().toISOString();
-        acct.trialExpiresAt = new Date(Date.now() + 14 * 24 * 3600_000).toISOString();
-        acct.vccLast4 = vcc.number.slice(-4);
+        acct.referralAcceptedAt = new Date().toISOString();
         if (capturedApiKey) acct.apiKey = capturedApiKey;
         if (capturedToken) acct.firebaseIdToken = capturedToken;
         saveAccounts(data);
-        await syncToSessions(acct);
       }
 
       // 更新推荐人记录
@@ -7054,18 +6965,18 @@ async function referralFlow(referrerAccount, vcc, options = {}) {
         referrerAcct.referrals.push({
           email: newAccount.email,
           referralCode,
-          bonusCredits: 250,
-          at: new Date().toISOString(),
+          acceptedAt: new Date().toISOString(),
         });
-        referrerAcct.referralBonusTotal = (referrerAcct.referralBonusTotal || 0) + 250;
         saveAccounts(data);
       }
 
       console.log(`\n${prefix} ═══════════════════════════════════════`);
-      console.log(`${prefix} ✓ 邀请推荐完成!`);
-      console.log(`${prefix}   推荐人: ${referrerAccount.email} (+250 credits)`);
-      console.log(`${prefix}   被推荐: ${newAccount.email} (+250 credits)`);
+      console.log(`${prefix} ✓ 推荐接受完成!`);
+      console.log(`${prefix}   推荐人: ${referrerAccount.email}`);
+      console.log(`${prefix}   被推荐: ${newAccount.email}`);
       console.log(`${prefix}   推荐码: ${referralCode}`);
+      console.log(`${prefix}   → 下一步: activate-trial --email ${newAccount.email}`);
+      console.log(`${prefix}   → 订阅 Pro 后双方各获 +250 credits`);
       console.log(`${prefix} ═══════════════════════════════════════`);
 
       return {
@@ -7073,7 +6984,6 @@ async function referralFlow(referrerAccount, vcc, options = {}) {
         referrerEmail: referrerAccount.email,
         newEmail: newAccount.email,
         referralCode,
-        bonusCredits: 250,
       };
     } else {
       console.log(`${prefix}   ✗ 接受推荐失败: ${result.error}`);
