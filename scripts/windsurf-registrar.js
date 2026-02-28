@@ -5986,37 +5986,125 @@ async function submitStripePayment(page, screenshotDir) {
     await new Promise(r => setTimeout(r, 5000));
   }
 
+  // 轮询等待支付结果（最多 30s）
+  console.log(`${prefix}   → 轮询等待支付结果 (最多 30s)...`);
+  let pollResult = null; // "success" | "error" | null
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const curUrl = page.url();
+    const curText = await page.evaluate(() => (document.body?.innerText || "").substring(0, 500).toLowerCase());
+
+    // 成功: 页面跳转离开 stripe
+    if (!curUrl.includes("stripe") && !curUrl.includes("error")) {
+      console.log(`${prefix}   ✓ 页面已跳转: ${curUrl.substring(0, 80)} (${(i+1)*2}s)`);
+      pollResult = "success";
+      break;
+    }
+
+    // 成功: 页面文字包含成功关键词
+    if (curText.includes("thank") || curText.includes("success") ||
+        curText.includes("welcome") || curText.includes("activated") ||
+        curText.includes("trial started") || curText.includes("pro plan")) {
+      console.log(`${prefix}   ✓ 检测到成功文字 (${(i+1)*2}s)`);
+      pollResult = "success";
+      break;
+    }
+
+    // 失败: 明确的错误信息
+    if (curText.includes("declined") || curText.includes("insufficient") ||
+        (curText.includes("invalid") && !curText.includes("processing"))) {
+      console.log(`${prefix}   ✗ 检测到错误: ${curText.substring(0, 100)} (${(i+1)*2}s)`);
+      pollResult = "error";
+      break;
+    }
+
+    // 还在处理中
+    if (i % 5 === 4) console.log(`${prefix}   ⏳ 仍在处理中... (${(i+1)*2}s)`);
+  }
+
   await page.screenshot({ path: path.join(screenshotDir, `stripe-3-submitted-${Date.now()}.png`), fullPage: true });
 
-  // 检查结果
   const finalUrl = page.url();
   const finalText = await page.evaluate(() => (document.body?.innerText || "").substring(0, 500).toLowerCase());
   console.log(`${prefix}   最终 URL: ${finalUrl}`);
 
-  const isSuccess = finalText.includes("thank") || finalText.includes("success") ||
-    finalText.includes("welcome") || finalText.includes("activated") ||
-    finalText.includes("trial started") || finalText.includes("pro plan") ||
-    finalUrl.includes("success") || finalUrl.includes("welcome") ||
-    // 如果回到了 windsurf 页面（不再是 stripe），通常意味着成功
-    (!finalUrl.includes("stripe") && !finalUrl.includes("error"));
-
-  const isError = finalText.includes("declined") || finalText.includes("failed") ||
-    finalText.includes("error") || finalText.includes("invalid") ||
-    finalText.includes("insufficient");
-
-  if (isError) {
-    const errorSnippet = finalText.substring(0, 200);
-    console.log(`${prefix}   ✗ 支付失败: ${errorSnippet}`);
-    return { success: false, error: "payment_declined", detail: errorSnippet };
+  if (pollResult === "error") {
+    console.log(`${prefix}   ✗ 支付失败: ${finalText.substring(0, 200)}`);
+    return { success: false, error: "payment_declined", detail: finalText.substring(0, 200) };
   }
 
-  if (isSuccess) {
+  if (pollResult === "success") {
     console.log(`${prefix}   ✓ Pro Trial 激活成功!`);
+    return { success: true };
+  }
+
+  // 轮询无明确结果 → IMAP 邮件确认兜底
+  console.log(`${prefix}   → 页面状态不确定，检查邮件确认...`);
+  const emailConfirmed = await checkTrialEmailConfirmation(page._trialEmail);
+  if (emailConfirmed) {
+    console.log(`${prefix}   ✓ 邮件确认: Pro Trial 激活成功!`);
     return { success: true };
   }
 
   console.log(`${prefix}   ⚠ 状态不确定: ${finalText.substring(0, 150)}`);
   return { success: false, error: "uncertain_status", url: finalUrl };
+}
+
+/**
+ * IMAP 邮件确认：检查是否收到 Windsurf Pro 欢迎邮件
+ */
+async function checkTrialEmailConfirmation(targetEmail, timeoutSecs = 30) {
+  if (!CONFIG.imapUser || !CONFIG.imapPass || !targetEmail) return false;
+  const prefix = "[email-check]";
+  console.log(`${prefix} 检查 ${targetEmail} 的 Pro 欢迎邮件 (${timeoutSecs}s)...`);
+
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutSecs * 1000) {
+    let imap;
+    try {
+      await acquireImapSlot();
+      imap = new MiniIMAP(CONFIG.imapHost, CONFIG.imapPort);
+      await imap.connect();
+      await imap.login(CONFIG.imapUser, CONFIG.imapPass);
+      await imap.select("INBOX");
+
+      // 搜索 Windsurf 发来的含 "Pro" 关键词的邮件
+      const toAddr = targetEmail.toLowerCase();
+      let uids = await imap.search(`UNSEEN FROM "windsurf" TO "${toAddr}"`).catch(() => []);
+      if (uids.length === 0) {
+        uids = await imap.search(`FROM "windsurf" TO "${toAddr}"`).catch(() => []);
+      }
+
+      // 检查最新几封邮件的内容
+      const recentUids = uids.slice(-3);
+      for (const uid of recentUids) {
+        try {
+          const body = await imap.fetchBody(uid);
+          const lower = body.toLowerCase();
+          if (lower.includes("pro plan") || lower.includes("pro trial") ||
+              lower.includes("500 cascade") || lower.includes("thanks for being a part") ||
+              lower.includes("windsurf pro") || lower.includes("swe-1")) {
+            console.log(`${prefix} ✓ 找到 Pro 欢迎邮件 (UID ${uid})`);
+            await imap.logout();
+            releaseImapSlot();
+            return true;
+          }
+        } catch {}
+      }
+
+      await imap.logout();
+    } catch (e) {
+      console.log(`${prefix} IMAP 错误: ${e.message.substring(0, 50)}`);
+    } finally {
+      releaseImapSlot();
+    }
+
+    // 等 5s 再查
+    await new Promise(r => setTimeout(r, 5000));
+  }
+
+  console.log(`${prefix} 未找到确认邮件`);
+  return false;
 }
 
 /**
@@ -6068,6 +6156,9 @@ async function activateProTrial(account, vcc, options = {}) {
 
   const screenshotDir = path.join(PROJECT_ROOT, "screenshots");
   fs.mkdirSync(screenshotDir, { recursive: true });
+
+  // 传递邮箱给 page，供 submitStripePayment 邮件确认兜底使用
+  page._trialEmail = email;
 
   let capturedToken = null;
   let capturedApiKey = null;
