@@ -5544,6 +5544,30 @@ async function fillStripeCheckoutPage(page, vcc, screenshotDir) {
 
   await new Promise(r => setTimeout(r, 1000));
 
+  // 取消勾选 "Save my information for faster checkout" 避免 Stripe Link 弹电话号码
+  const uncheckResult = await page.evaluate(() => {
+    // 方式1: 直接找 checkbox
+    const cb = document.querySelector('#enableStripePass, input[name="enableStripePass"]');
+    if (cb && cb.checked) { cb.click(); return 'clicked #enableStripePass'; }
+    // 方式2: 找包含文字的 checkbox 容器
+    const labels = [...document.querySelectorAll('label, div, span')];
+    for (const el of labels) {
+      const t = (el.textContent || '').trim();
+      if ((t.includes('Save my information') || t.includes('保存') || t.includes('faster checkout')) && el.offsetParent !== null) {
+        const input = el.querySelector('input[type="checkbox"]') || el.closest('label')?.querySelector('input[type="checkbox"]');
+        if (input && input.checked) { input.click(); return 'clicked via label'; }
+        // 也可能是个 div 按钮
+        el.click();
+        return 'clicked container: ' + t.substring(0, 30);
+      }
+    }
+    return null;
+  });
+  if (uncheckResult) {
+    console.log(`${prefix}   ✓ 取消 Stripe Link: ${uncheckResult}`);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
   // 关闭 Stripe Link 弹窗（如果出现）
   const linkDismissed = await page.evaluate(() => {
     const btns = [...document.querySelectorAll("button, a")];
@@ -5742,12 +5766,23 @@ async function submitStripePayment(page, screenshotDir) {
   console.log(`${prefix}   → 等待支付处理...`);
   await new Promise(r => setTimeout(r, 5000));
 
-  // 检测 hCaptcha 弹窗
+  // 检测 hCaptcha 弹窗（仅检测可见的 challenge，不被 invisible iframe 误触发）
   const hasHCaptcha = await page.evaluate(() => {
     const text = document.body?.innerText || "";
-    return text.includes("I am human") || text.includes("One more step") ||
-      document.querySelector('iframe[src*="hcaptcha"]') !== null ||
-      document.querySelector('[data-hcaptcha-widget-id]') !== null;
+    // 只检测可见文字，不检测 invisible iframe（Stripe 始终有 invisible hCaptcha iframe）
+    if (text.includes("I am human") || text.includes("One more step") ||
+        text.includes("真实访客") || text.includes("还需一步")) {
+      return true;
+    }
+    // 检测可见的 hCaptcha iframe（宽高 > 100 才算可见弹窗）
+    const iframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+    for (const iframe of iframes) {
+      const rect = iframe.getBoundingClientRect();
+      if (rect.width > 100 && rect.height > 100 && rect.height < 2000) {
+        return true;
+      }
+    }
+    return false;
   });
 
   if (hasHCaptcha) {
