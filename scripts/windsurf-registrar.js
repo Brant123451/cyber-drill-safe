@@ -6659,9 +6659,70 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
 
   if (!clickResult) {
     console.log(`${prefix}   ⚠ 未找到明显的接受按钮，尝试继续...`);
-    // 页面可能直接就是 Stripe checkout
   } else {
     console.log(`${prefix}   ✓ 点击: "${clickResult.clicked}" (keyword: ${clickResult.keyword})`);
+  }
+
+  // 等待页面响应（可能出现 "Referral Activated" 中间页）
+  await new Promise(r => setTimeout(r, 3000));
+
+  const activatedPage = await page.evaluate(() => {
+    const text = (document.body?.innerText || "").toLowerCase();
+    return text.includes("referral activated") || text.includes("referral from");
+  });
+
+  if (activatedPage) {
+    console.log(`${prefix}   → 检测到 "Referral Activated" 页面，点击 View plans...`);
+    await page.screenshot({ path: path.join(screenshotDir, `referral-activated-${Date.now()}.png`), fullPage: true });
+
+    const viewPlansClicked = await page.evaluate(() => {
+      const allEls = [...document.querySelectorAll("button, a, [role='button']")];
+      const keywords = ["view plans", "view plan", "see plans", "subscribe", "start trial", "get started", "upgrade"];
+      for (const kw of keywords) {
+        const el = allEls.find(e => {
+          const t = (e.textContent || "").toLowerCase().trim();
+          return t.includes(kw) && e.offsetParent !== null;
+        });
+        if (el) {
+          if (el.href) location.href = el.href;
+          else el.click();
+          return (el.textContent || "").trim().substring(0, 40);
+        }
+      }
+      return null;
+    });
+
+    if (viewPlansClicked) {
+      console.log(`${prefix}   ✓ 点击: "${viewPlansClicked}"`);
+      await new Promise(r => setTimeout(r, 5000));
+      // View plans 可能跳到 pricing 页面，需要再点 "Start free trial"
+      const pricingUrl = page.url();
+      console.log(`${prefix}   URL: ${pricingUrl}`);
+      if (pricingUrl.includes("pricing") || pricingUrl.includes("windsurf.com")) {
+        const startTrialClicked = await page.evaluate(() => {
+          const btns = [...document.querySelectorAll("button, a")];
+          const keywords = ["start free trial", "start trial", "try pro", "subscribe", "get started"];
+          for (const kw of keywords) {
+            const btn = btns.find(b => {
+              const t = (b.textContent || "").toLowerCase().trim();
+              return t.includes(kw) && b.offsetParent !== null;
+            });
+            if (btn) {
+              if (btn.href) location.href = btn.href;
+              else btn.click();
+              return (btn.textContent || "").trim().substring(0, 40);
+            }
+          }
+          return null;
+        });
+        if (startTrialClicked) {
+          console.log(`${prefix}   ✓ 点击 pricing: "${startTrialClicked}"`);
+          await new Promise(r => setTimeout(r, 5000));
+        }
+      }
+    } else {
+      console.log(`${prefix}   ⚠ 未找到 View plans 按钮`);
+    }
   }
 
   // 等待 Turnstile（如果有）
