@@ -5468,21 +5468,21 @@ async function fillStripeCheckoutPage(page, vcc, screenshotDir) {
     }
     await new Promise(r => setTimeout(r, 800));
 
-    // 邮编
-    if (vcc.zip) {
-      const zipSelectors = [
-        'input[name="billingPostalCode"]', 'input[name="postalCode"]',
-        'input[name="postal"]', 'input[name="zip"]', 'input[autocomplete="postal-code"]',
-      ];
-      for (const sel of zipSelectors) {
-        const el = await page.$(sel);
-        if (el) {
-          await el.click({ clickCount: 3 });
-          await el.type(vcc.zip || '048616', { delay: 50 });
-          await page.keyboard.press("Escape");
-          console.log(`${prefix}   ✓ 邮编 (${sel})`);
-          break;
-        }
+    // 邮编（国家为 SG 时强制用新加坡邮编，避免 VCC 自带的美国邮编被拒）
+    const sgZip = '048616';
+    const zipToUse = sgZip; // 国家已选 SG，必须用新加坡邮编
+    const zipSelectors = [
+      'input[name="billingPostalCode"]', 'input[name="postalCode"]',
+      'input[name="postal"]', 'input[name="zip"]', 'input[autocomplete="postal-code"]',
+    ];
+    for (const sel of zipSelectors) {
+      const el = await page.$(sel);
+      if (el) {
+        await el.click({ clickCount: 3 });
+        await el.type(zipToUse, { delay: 50 });
+        await page.keyboard.press("Escape");
+        console.log(`${prefix}   ✓ 邮编 ${zipToUse} (${sel})`);
+        break;
       }
     }
     await new Promise(r => setTimeout(r, 500));
