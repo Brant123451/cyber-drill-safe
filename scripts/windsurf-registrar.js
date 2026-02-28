@@ -5387,7 +5387,24 @@ async function fillStripeCheckoutPage(page, vcc, screenshotDir) {
     const el = await page.$(sel);
     if (el) {
       await el.click({ clickCount: 3 });
-      await el.type(vcc.number, { delay: 50 });
+      await new Promise(r => setTimeout(r, 200));
+      // 清空后逐字输入，delay 足够大避免 Stripe 格式化丢字
+      await el.evaluate(e => { e.value = ''; e.dispatchEvent(new Event('input', {bubbles:true})); });
+      await new Promise(r => setTimeout(r, 300));
+      await el.click();
+      for (const ch of vcc.number) {
+        await el.type(ch, { delay: 30 });
+        await new Promise(r => setTimeout(r, 40));
+      }
+      await new Promise(r => setTimeout(r, 500));
+      // 验证卡号是否完整
+      const cardVal = await el.evaluate(e => e.value.replace(/\s/g, ''));
+      if (cardVal.length < 15) {
+        console.log(`${prefix}   ⚠ 卡号不完整 (${cardVal.length} 位: ${cardVal}), 重试...`);
+        await el.click({ clickCount: 3 });
+        await new Promise(r => setTimeout(r, 200));
+        await el.type(vcc.number, { delay: 120 });
+      }
       console.log(`${prefix}   ✓ 卡号 (${sel})`);
       filled = true;
       break;
@@ -5549,16 +5566,16 @@ async function fillStripeCheckoutPage(page, vcc, screenshotDir) {
     // 方式1: 直接找 checkbox
     const cb = document.querySelector('#enableStripePass, input[name="enableStripePass"]');
     if (cb && cb.checked) { cb.click(); return 'clicked #enableStripePass'; }
-    // 方式2: 找包含文字的 checkbox 容器
+    // 方式2: 找包含文字的 checkbox 容器（限制文本长度，避免匹配到整个页面）
     const labels = [...document.querySelectorAll('label, div, span')];
     for (const el of labels) {
       const t = (el.textContent || '').trim();
-      if ((t.includes('Save my information') || t.includes('保存') || t.includes('faster checkout')) && el.offsetParent !== null) {
+      // 只匹配短文本元素（< 150 字符），避免匹配到大容器
+      if (t.length > 150) continue;
+      if ((t.includes('Save my information') || t.includes('faster checkout')) && el.offsetParent !== null) {
         const input = el.querySelector('input[type="checkbox"]') || el.closest('label')?.querySelector('input[type="checkbox"]');
         if (input && input.checked) { input.click(); return 'clicked via label'; }
-        // 也可能是个 div 按钮
-        el.click();
-        return 'clicked container: ' + t.substring(0, 30);
+        if (input) { input.click(); return 'clicked checkbox in container'; }
       }
     }
     return null;
