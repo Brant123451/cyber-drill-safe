@@ -5816,9 +5816,32 @@ async function submitStripePayment(page, screenshotDir) {
               const box = await el.boundingBox();
               if (box && box.width > 5 && box.height > 5) {
                 console.log(`${prefix}   ✓ 找到 ${sel}: ${box.width.toFixed(0)}x${box.height.toFixed(0)} at(${box.x.toFixed(0)},${box.y.toFixed(0)})`);
-                await el.click();
-                console.log(`${prefix}   ✓ frame.click() 完成`);
+                // 用 CDP Input.dispatchMouseEvent 代替 frame.click()（更底层，不易被检测）
+                const cdpClient = await page.createCDPSession();
+                const cx = box.x + box.width / 2;
+                const cy = box.y + box.height / 2;
+                // 模拟真实鼠标轨迹
+                await cdpClient.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx - 40, y: cy - 15 });
+                await new Promise(r => setTimeout(r, 30));
+                await cdpClient.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx - 10, y: cy - 3 });
+                await new Promise(r => setTimeout(r, 20));
+                await cdpClient.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+                await new Promise(r => setTimeout(r, 80 + Math.random() * 50));
+                await cdpClient.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+                await new Promise(r => setTimeout(r, 40 + Math.random() * 30));
+                await cdpClient.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+                console.log(`${prefix}   ✓ CDP click (${cx.toFixed(0)}, ${cy.toFixed(0)})`);
+                await cdpClient.detach();
                 clicked = true;
+
+                // 等 5s 看是否弹出图片挑战
+                await new Promise(r => setTimeout(r, 5000));
+                try {
+                  const screenshot = await page.screenshot({ encoding: "binary" });
+                  const ssPath = path.join(screenshotDir, `hcaptcha-after-cdp-click-${Date.now()}.png`);
+                  fs.writeFileSync(ssPath, screenshot);
+                  console.log(`${prefix}   截图: ${ssPath}`);
+                } catch {}
                 break;
               }
             }
