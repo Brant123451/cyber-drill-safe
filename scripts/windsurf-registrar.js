@@ -5789,8 +5789,116 @@ async function submitStripePayment(page, screenshotDir) {
     console.log(`${prefix}   → 检测到 hCaptcha!`);
     await page.screenshot({ path: path.join(screenshotDir, `stripe-hcaptcha-${Date.now()}.png`), fullPage: true });
 
-    // 方式 1：通过 page.frames() 找 hCaptcha checkbox 精确点击
     let hcaptchaSolved = false;
+
+    // ══ 方式 0：CapSolver token 注入（优先） ══
+    try {
+      // 提取 sitekey
+      const sitekey = await page.evaluate(() => {
+        // 从 hCaptcha iframe src 提取
+        const iframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+        for (const iframe of iframes) {
+          const m = iframe.src.match(/sitekey=([a-f0-9-]+)/i);
+          if (m) return m[1];
+        }
+        // 从 data-sitekey 属性提取
+        const el = document.querySelector('[data-sitekey]');
+        if (el) return el.getAttribute('data-sitekey');
+        return null;
+      });
+
+      const hcSitekey = sitekey || "c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a"; // fallback 已知 Stripe sitekey
+      const pageUrl = page.url();
+      console.log(`${prefix}   → CapSolver hCaptcha token 注入...`);
+      console.log(`${prefix}     sitekey: ${hcSitekey}`);
+      console.log(`${prefix}     url: ${pageUrl.substring(0, 80)}`);
+
+      const hcToken = await solveHCaptchaWithCapSolver(pageUrl, hcSitekey, 2);
+
+      if (hcToken) {
+        console.log(`${prefix}   ✓ 获得 hCaptcha token, 注入中...`);
+
+        // 注入 token 到 hCaptcha iframe
+        const injected = await page.evaluate((token) => {
+          // 方法 1: 找 h-captcha-response textarea
+          const textareas = document.querySelectorAll('textarea[name="h-captcha-response"], textarea[id*="h-captcha-response"]');
+          for (const ta of textareas) {
+            ta.value = token;
+            ta.dispatchEvent(new Event("input", { bubbles: true }));
+            ta.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          // 方法 2: 找 g-recaptcha-response textarea（某些实现用这个）
+          const gTextareas = document.querySelectorAll('textarea[name="g-recaptcha-response"]');
+          for (const ta of gTextareas) {
+            ta.value = token;
+            ta.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+
+          return textareas.length + gTextareas.length;
+        }, hcToken);
+
+        // 也在所有 hCaptcha frames 里注入
+        const allFrames = page.frames();
+        for (const frame of allFrames) {
+          if (!frame.url().includes("hcaptcha")) continue;
+          try {
+            await frame.evaluate((token) => {
+              const ta = document.querySelector('textarea[name="h-captcha-response"]');
+              if (ta) { ta.value = token; ta.dispatchEvent(new Event("input", { bubbles: true })); }
+              // 触发 hCaptcha 回调
+              if (window.hcaptcha) {
+                try { window.hcaptcha.execute(); } catch {}
+              }
+            }, hcToken);
+          } catch {}
+        }
+
+        // 尝试触发页面级 hcaptcha 回调
+        await page.evaluate((token) => {
+          if (window.hcaptcha) {
+            try {
+              // 尝试直接设置 response
+              const widgets = document.querySelectorAll('.h-captcha, [data-hcaptcha-widget-id]');
+              widgets.forEach(w => {
+                const wid = w.getAttribute('data-hcaptcha-widget-id') || '0';
+                try { window.hcaptcha.setResponse(token, wid); } catch {}
+              });
+            } catch {}
+          }
+          // 触发所有可能的回调
+          document.querySelectorAll('form').forEach(f => {
+            try { f.dispatchEvent(new Event('submit', { bubbles: true })); } catch {}
+          });
+        }, hcToken);
+
+        console.log(`${prefix}   ✓ token 已注入 (主页面 ${injected} 个 textarea)`);
+        await new Promise(r => setTimeout(r, 5000));
+
+        // 检查是否通过
+        const solved = await page.evaluate(() => {
+          const text = document.body?.innerText || "";
+          const noHc = !text.includes("I am human") && !text.includes("One more step");
+          return noHc;
+        });
+
+        if (solved) {
+          hcaptchaSolved = true;
+          console.log(`${prefix}   ✓ hCaptcha token 注入成功!`);
+        } else {
+          console.log(`${prefix}   ⚠ token 注入后 hCaptcha 仍在，尝试 CDP 点击...`);
+        }
+
+        await page.screenshot({ path: path.join(screenshotDir, `hcaptcha-after-token-${Date.now()}.png`), fullPage: true });
+      } else {
+        console.log(`${prefix}   ⚠ CapSolver 未返回 token，尝试 CDP 点击...`);
+      }
+    } catch (e) {
+      console.log(`${prefix}   ⚠ CapSolver hCaptcha 异常: ${e.message.substring(0, 80)}`);
+    }
+
+    // ══ 方式 1：CDP 点击 hCaptcha checkbox（CapSolver 失败时） ══
+    if (!hcaptchaSolved) {
     try {
       await new Promise(r => setTimeout(r, 3000)); // 等 hCaptcha iframe 完全加载
 
@@ -5937,6 +6045,7 @@ async function submitStripePayment(page, screenshotDir) {
     } catch (e) {
       console.log(`${prefix}   hCaptcha 点击失败: ${e.message}`);
     }
+    } // end if (!hcaptchaSolved) — 方式 1 CDP 点击
 
     // 方式 2：暂停等待手动点击（通过 SSH 隧道 + edge://inspect）
     if (!hcaptchaSolved) {
