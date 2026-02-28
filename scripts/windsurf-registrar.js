@@ -5761,27 +5761,33 @@ async function submitStripePayment(page, screenshotDir) {
       const client = await page.createCDPSession();
       const { root } = await client.send("DOM.getDocument", { depth: -1, pierce: true });
 
-      // 递归搜索所有嵌套 iframe/shadow DOM，找 checkbox
+      // 递归搜索所有嵌套 iframe/shadow DOM，找 checkbox 和相关元素
       const hits = [];
       async function deepFind(node) {
         const tag = node.nodeName;
         const attrs = node.attributes || [];
-        let id = "", cls = "", src = "", role = "";
+        let id = "", cls = "", src = "", role = "", type = "", tabindex = "";
         for (let i = 0; i < attrs.length; i += 2) {
           if (attrs[i] === "id") id = attrs[i + 1];
           if (attrs[i] === "class") cls = attrs[i + 1];
           if (attrs[i] === "src") src = attrs[i + 1];
           if (attrs[i] === "role") role = attrs[i + 1];
+          if (attrs[i] === "type") type = attrs[i + 1];
+          if (attrs[i] === "tabindex") tabindex = attrs[i + 1];
         }
-        const isTarget = id.includes("checkbox") || role === "checkbox" || cls.includes("checkbox");
-        const isHcIframe = tag === "IFRAME" && src.includes("hcaptcha");
+        // 匹配: id/class/role 含 checkbox/check，input[type=checkbox]，tabindex=0 的可交互元素
+        const isTarget = id === "checkbox" || id.includes("checkbox") ||
+          role === "checkbox" || cls.includes("check") ||
+          (tag === "INPUT" && type === "checkbox") ||
+          (tabindex === "0" && cls.includes("anchor"));
+        const isHcIframe = tag === "IFRAME" && (src.includes("hcaptcha") || src.includes("captcha"));
         if (isTarget || isHcIframe) {
           try {
             const { model } = await client.send("DOM.getBoxModel", { nodeId: node.nodeId });
             const c = model.content;
             const box = { x: c[0], y: c[1], w: c[2] - c[0], h: c[5] - c[1] };
             if (box.w > 0 && box.h > 0) {
-              hits.push({ tag, id, role, src: src.substring(0, 60), box });
+              hits.push({ tag, id, cls: cls.substring(0, 50), role, type, src: src.substring(0, 80), box, nodeId: node.nodeId });
             }
           } catch {}
         }
@@ -5796,24 +5802,49 @@ async function submitStripePayment(page, screenshotDir) {
       await deepFind(root);
       console.log(`${prefix}   找到 ${hits.length} 个匹配元素:`);
       for (const h of hits) {
-        console.log(`${prefix}     <${h.tag}> id=${h.id} role=${h.role} ${h.box.w.toFixed(0)}x${h.box.h.toFixed(0)} at(${h.box.x.toFixed(0)},${h.box.y.toFixed(0)}) src=${h.src}`);
+        console.log(`${prefix}     <${h.tag}> id="${h.id}" cls="${h.cls}" role="${h.role}" ${h.box.w.toFixed(0)}x${h.box.h.toFixed(0)} at(${h.box.x.toFixed(0)},${h.box.y.toFixed(0)})`);
       }
 
-      // 优先非 iframe 的 checkbox，其次小尺寸 hcaptcha iframe
-      let target = hits.find(h => h.tag !== "IFRAME" && (h.id.includes("checkbox") || h.role === "checkbox"));
-      if (!target) target = hits.find(h => h.tag === "IFRAME" && h.src.includes("hcaptcha") && h.box.w < 500 && h.box.h < 200);
-      if (!target && hits.length > 0) target = hits[0];
+      // 优先级: 1) id 精确为 "checkbox" 2) 非iframe的checkbox元素 3) 合适尺寸的hcaptcha iframe
+      let target = hits.find(h => h.id === "checkbox" && h.tag !== "IFRAME");
+      if (!target) target = hits.find(h => h.tag !== "IFRAME" && (h.role === "checkbox" || h.cls.includes("check")) && h.box.w < 500);
+      if (!target) target = hits.find(h => h.tag === "IFRAME" && h.src.includes("hcaptcha") && h.box.w < 500 && h.box.h > 30);
+      if (!target) target = hits.find(h => h.tag !== "IFRAME" && h.box.w < 500);
 
       if (target) {
-        const cx = target.box.x + target.box.w / 2;
+        // checkbox 方块在容器左侧，点左边 1/4 处的垂直中心
+        const cx = target.box.x + Math.min(target.box.w * 0.15, 30);
         const cy = target.box.y + target.box.h / 2;
-        console.log(`${prefix}   → 精确点击 (${cx.toFixed(0)}, ${cy.toFixed(0)})...`);
-        await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx, y: cy });
+        console.log(`${prefix}   → 精确点击左侧 checkbox (${cx.toFixed(0)}, ${cy.toFixed(0)})...`);
+
+        // 先移过去再点（模拟真实用户行为）
+        for (const [dx, dy] of [[cx - 50, cy - 20], [cx - 20, cy - 5], [cx, cy]]) {
+          await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: dx, y: dy });
+          await new Promise(r => setTimeout(r, 30));
+        }
         await new Promise(r => setTimeout(r, 100));
         await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
         await new Promise(r => setTimeout(r, 50));
         await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
         console.log(`${prefix}   ✓ 已点击`);
+
+        // 等 3s，如果没过，再点一次稍微偏移的位置
+        await new Promise(r => setTimeout(r, 3000));
+        const check1 = await page.evaluate(() => {
+          const t = document.body?.innerText || "";
+          return t.includes("I am human") || t.includes("真实访客");
+        });
+        if (check1) {
+          const cx2 = target.box.x + 18;
+          const cy2 = target.box.y + target.box.h / 2 + 2;
+          console.log(`${prefix}   → 重试点击 (${cx2.toFixed(0)}, ${cy2.toFixed(0)})...`);
+          await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: cx2, y: cy2 });
+          await new Promise(r => setTimeout(r, 80));
+          await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x: cx2, y: cy2, button: "left", clickCount: 1 });
+          await new Promise(r => setTimeout(r, 50));
+          await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx2, y: cy2, button: "left", clickCount: 1 });
+          console.log(`${prefix}   ✓ 重试已点击`);
+        }
       } else {
         console.log(`${prefix}   ✗ 未找到 checkbox 元素`);
       }
