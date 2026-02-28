@@ -8,6 +8,7 @@ import https from "node:https";
 import { getAdapter, sendAdapterRequest, sendAdapterStreamRequest } from "./protocol-adapter.js";
 import { replaceConnectCredentials } from "./connect-proto.js";
 import { UserManager } from "./user-manager.js";
+import { getUserByApiKey, deductCredit, getActiveSubscription } from "./database.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -75,6 +76,35 @@ const ACCOUNT_HEALTHCHECK_RECOVERY_THRESHOLD = Number(
 const DEFAULT_ACCOUNT_DAILY_LIMIT = Number(process.env.DEFAULT_ACCOUNT_DAILY_LIMIT ?? 80_000);
 const SESSIONS_FILE = process.env.SESSIONS_FILE ?? "config/sessions.json";
 const USERS_FILE = process.env.USERS_FILE ?? "config/users.json";
+
+// ---- Windsurf Credits 模型消耗映射（对标 Windsurf 官方积分体系） ----
+const MODEL_CREDITS = {
+  // 免费模型
+  "swe-1": 0, "swe-1-lite": 0,
+  // 0.5 credits
+  "gpt-5-low": 0.5, "kimi-k2": 0.5, "qwen3-coder": 0.5,
+  "gpt-4o-mini": 0.5, "deepseek-chat": 0.5,
+  // 1 credit
+  "gemini-2.5-pro": 1, "gpt-4o": 1, "gpt-4": 1,
+  "claude-3-5-sonnet-20241022": 1, "deepseek-reasoner": 1,
+  // 1.5 credits
+  "gpt-5-high": 1.5, "gpt-5": 1.5,
+  // 按 token（用平均估算）
+  "claude-sonnet-4-20250514": 5, "claude-sonnet-4": 5,
+  // 高消耗模型
+  "claude-opus-4.1-thinking": 20, "claude-opus-4": 20, "claude-opus": 20,
+};
+const DEFAULT_MODEL_CREDITS = 1;
+
+function getModelCredits(model) {
+  if (!model) return DEFAULT_MODEL_CREDITS;
+  const lower = model.toLowerCase();
+  if (MODEL_CREDITS[lower] !== undefined) return MODEL_CREDITS[lower];
+  for (const [key, cost] of Object.entries(MODEL_CREDITS)) {
+    if (lower.includes(key) || key.includes(lower)) return cost;
+  }
+  return DEFAULT_MODEL_CREDITS;
+}
 
 // ---- User Manager (文件驱动用户管理 + 积分恢复) ----
 const userManager = new UserManager({
@@ -209,6 +239,300 @@ setInterval(() => refreshAllTokens(), TOKEN_REFRESH_INTERVAL_MS);
 
 const requestTimeline = new Map();
 const events = [];
+
+// ---- Session Credit Tracking (Trial 账号 credits 追踪) ----
+const TRIAL_INITIAL_CREDITS = Number(process.env.TRIAL_INITIAL_CREDITS ?? 100);
+const TRIAL_LOW_CREDITS_THRESHOLD = Number(process.env.TRIAL_LOW_CREDITS_THRESHOLD ?? 5);
+const sessionCreditsMap = new Map(); // sessionId → { remaining, total, requests, lastModel, updatedAt }
+
+// Windsurf 内部模型名 → credits 消耗映射
+const WINDSURF_MODEL_CREDITS = {
+  // Free (0 credits)
+  "swe-1": 0, "swe_1": 0, "swe-1-lite": 0, "swe_1_lite": 0,
+  "swe-1.5": 0, "swe_1_5": 0, "swe-1-5": 0,
+  // Value (0.5 credits)
+  "gpt-5-low": 0.5, "gpt_5_low": 0.5,
+  "kimi-k2": 0.5, "kimi_k2": 0.5,
+  "qwen3-coder": 0.5, "qwen3_coder": 0.5,
+  "gemini-2.5-flash": 0.5, "gemini_2_5_flash": 0.5,
+  // Premium (1 credit)
+  "gemini-2.5-pro": 1, "gemini_2_5_pro": 1,
+  "gpt-4o": 1, "gpt_4o": 1,
+  // Premium (1.5 credits)
+  "gpt-5": 1.5, "gpt-5-high": 1.5, "gpt_5_high": 1.5,
+  // By token (~5 credits average)
+  "claude-sonnet-4": 5, "claude_sonnet_4": 5,
+  // High consumption (~20 credits)
+  "claude-opus-4.1-thinking": 20, "claude_opus_4_1_thinking": 20,
+  "claude-opus-4": 20, "claude_opus_4": 20,
+};
+
+function getWindsurfModelCredits(modelName) {
+  if (!modelName) return 1; // default
+  const lower = modelName.toLowerCase().replace(/model_/g, "").replace(/google_|anthropic_|openai_/g, "");
+  // Exact match
+  if (WINDSURF_MODEL_CREDITS[lower] !== undefined) return WINDSURF_MODEL_CREDITS[lower];
+  // Fuzzy match
+  for (const [key, cost] of Object.entries(WINDSURF_MODEL_CREDITS)) {
+    if (lower.includes(key) || key.includes(lower)) return cost;
+  }
+  return 1; // default 1 credit for unknown models
+}
+
+function getSessionCredits(sessionId) {
+  let entry = sessionCreditsMap.get(sessionId);
+  if (!entry) {
+    entry = { remaining: TRIAL_INITIAL_CREDITS, total: TRIAL_INITIAL_CREDITS, requests: 0, lastModel: null, updatedAt: Date.now() };
+    sessionCreditsMap.set(sessionId, entry);
+  }
+  return entry;
+}
+
+function deductSessionCredits(sessionId, model) {
+  const entry = getSessionCredits(sessionId);
+  const cost = getWindsurfModelCredits(model);
+  const before = entry.remaining;
+  entry.remaining = Math.max(0, entry.remaining - cost);
+  entry.requests++;
+  entry.lastModel = model;
+  entry.updatedAt = Date.now();
+  return { before, after: entry.remaining, cost, model };
+}
+
+// 当 session credits 耗尽，清除绑定该 session 的所有 affinity
+function evictSessionAffinity(sessionId) {
+  let evicted = 0;
+  for (const [ip, aff] of sessionAffinityMap) {
+    if (aff.sessionId === sessionId) {
+      sessionAffinityMap.delete(ip);
+      evicted++;
+    }
+  }
+  return evicted;
+}
+
+// 从 protobuf 响应中提取 model 名称（兼容 Windsurf 内部格式）
+function extractModelFromWindsurfResponse(resBody) {
+  try {
+    const str = resBody.toString("utf8");
+    // Windsurf 内部格式: MODEL_CLAUDE_SONNET_4, MODEL_SWE_1_5_SLOW 等
+    const internalMatch = str.match(/MODEL_([A-Z0-9_]+)/i);
+    if (internalMatch) return internalMatch[0].toLowerCase();
+    // 标准格式: claude-sonnet-4, gpt-5 等
+    const stdMatch = str.match(/(claude-[a-z0-9._-]+|gpt-[a-z0-9._-]+|gemini-[a-z0-9._-]+|swe-[a-z0-9._-]+|kimi-[a-z0-9._-]+|qwen[a-z0-9._-]+|deepseek-[a-z0-9._-]+)/i);
+    if (stdMatch) return stdMatch[1].toLowerCase();
+    return null;
+  } catch { return null; }
+}
+
+// ---- Session Affinity (用户/IP → 固定注册号绑定) ----
+const SESSION_AFFINITY_TTL_MS = Number(process.env.SESSION_AFFINITY_TTL_MS ?? 30 * 60_000); // 30 min
+const MAX_USERS_PER_SESSION = Number(process.env.MAX_USERS_PER_SESSION ?? 4);
+const sessionAffinityMap = new Map(); // clientIp → { sessionId, expiresAt }
+
+function getAffinitySession(clientIp) {
+  const entry = sessionAffinityMap.get(clientIp);
+  if (entry && entry.expiresAt > Date.now()) {
+    // Check the session is still alive
+    const sessions = sessionManager.getEnabledSessions();
+    const bound = sessions.find(s => s.id === entry.sessionId);
+    if (bound) {
+      // Check if bound session still has credits
+      const credits = getSessionCredits(bound.id);
+      if (credits.remaining > 0) {
+        // Extend TTL on use
+        entry.expiresAt = Date.now() + SESSION_AFFINITY_TTL_MS;
+        return bound;
+      }
+      // Credits exhausted → force re-bind
+      console.log(`[affinity] ${clientIp}: session ${bound.id} credits exhausted (${credits.requests} reqs), re-binding...`);
+      sessionAffinityMap.delete(clientIp);
+    } else {
+      // Session died, clear affinity
+      sessionAffinityMap.delete(clientIp);
+    }
+  }
+
+  // Pick a new session with affinity-aware + credit-aware load balancing
+  const sessions = sessionManager.getEnabledSessions();
+  if (sessions.length === 0) return null;
+
+  // Count current bindings per session
+  const bindCount = new Map();
+  const now = Date.now();
+  for (const [, aff] of sessionAffinityMap) {
+    if (aff.expiresAt > now) {
+      bindCount.set(aff.sessionId, (bindCount.get(aff.sessionId) ?? 0) + 1);
+    }
+  }
+
+  // Filter: must have credits > 0 AND not at max bindings
+  const candidates = sessions
+    .filter(s => {
+      const credits = getSessionCredits(s.id);
+      return credits.remaining > 0 && (bindCount.get(s.id) ?? 0) < MAX_USERS_PER_SESSION;
+    })
+    .sort((a, b) => {
+      const ba = bindCount.get(a.id) ?? 0;
+      const bb = bindCount.get(b.id) ?? 0;
+      if (ba !== bb) return ba - bb; // fewer bindings first
+      // Then prefer more remaining credits
+      const ca = getSessionCredits(a.id).remaining;
+      const cb = getSessionCredits(b.id).remaining;
+      return cb - ca; // more credits first
+    });
+
+  if (candidates.length === 0) {
+    // All sessions depleted or at max capacity → fallback to session with most credits
+    const fallback = sessions
+      .filter(s => getSessionCredits(s.id).remaining > 0)
+      .sort((a, b) => getSessionCredits(b.id).remaining - getSessionCredits(a.id).remaining)[0];
+    if (!fallback) {
+      // All sessions have 0 credits — pick least-used as last resort
+      const lastResort = sessions.sort((a, b) => {
+        const sa = sessionManager.sessionState.get(a.id);
+        const sb = sessionManager.sessionState.get(b.id);
+        return (sa?.usedTokens ?? 0) - (sb?.usedTokens ?? 0);
+      })[0];
+      console.log(`[affinity] ${clientIp} -> ${lastResort.id} (ALL sessions depleted, last resort)`);
+      sessionAffinityMap.set(clientIp, { sessionId: lastResort.id, expiresAt: Date.now() + SESSION_AFFINITY_TTL_MS });
+      return lastResort;
+    }
+    sessionAffinityMap.set(clientIp, { sessionId: fallback.id, expiresAt: Date.now() + SESSION_AFFINITY_TTL_MS });
+    console.log(`[affinity] ${clientIp} -> ${fallback.id} (overflow, credits=${Math.round(getSessionCredits(fallback.id).remaining)})`);
+    return fallback;
+  }
+
+  const picked = candidates[0];
+  sessionAffinityMap.set(clientIp, { sessionId: picked.id, expiresAt: Date.now() + SESSION_AFFINITY_TTL_MS });
+  console.log(`[affinity] ${clientIp} -> ${picked.id} (${(bindCount.get(picked.id) ?? 0) + 1} users, credits=${Math.round(getSessionCredits(picked.id).remaining)})`);
+  return picked;
+}
+
+// Cleanup expired affinity entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of sessionAffinityMap) {
+    if (entry.expiresAt <= now) sessionAffinityMap.delete(ip);
+  }
+}, 300_000).unref?.();
+
+// ---- Bandwidth / smoothness tracking ----
+const bandwidthStats = {
+  concurrentRequests: 0,
+  peakConcurrent: 0,
+  // Rolling window of recent request metrics (last 200)
+  recentRequests: [],
+  maxRecent: 200,
+  // Totals since startup
+  totalRequests: 0,
+  totalBytesIn: 0,
+  totalBytesOut: 0,
+  totalErrors: 0,
+  startedAt: Date.now(),
+};
+
+function bwTrackStart() {
+  bandwidthStats.concurrentRequests++;
+  if (bandwidthStats.concurrentRequests > bandwidthStats.peakConcurrent) {
+    bandwidthStats.peakConcurrent = bandwidthStats.concurrentRequests;
+  }
+  return { startTime: Date.now(), bytesIn: 0, bytesOut: 0 };
+}
+
+function bwTrackEnd(tracker, statusCode) {
+  bandwidthStats.concurrentRequests = Math.max(0, bandwidthStats.concurrentRequests - 1);
+  const durationMs = Date.now() - tracker.startTime;
+  const entry = {
+    ts: Date.now(),
+    durationMs,
+    bytesIn: tracker.bytesIn,
+    bytesOut: tracker.bytesOut,
+    status: statusCode,
+    ok: statusCode >= 200 && statusCode < 400,
+  };
+  bandwidthStats.recentRequests.push(entry);
+  if (bandwidthStats.recentRequests.length > bandwidthStats.maxRecent) {
+    bandwidthStats.recentRequests.shift();
+  }
+  bandwidthStats.totalRequests++;
+  bandwidthStats.totalBytesIn += tracker.bytesIn;
+  bandwidthStats.totalBytesOut += tracker.bytesOut;
+  if (!entry.ok) bandwidthStats.totalErrors++;
+}
+
+function getBandwidthMetrics() {
+  const now = Date.now();
+  const recent = bandwidthStats.recentRequests;
+  const last60s = recent.filter(r => now - r.ts < 60_000);
+  const last5m = recent.filter(r => now - r.ts < 300_000);
+
+  // Latency stats
+  const latencies = last60s.map(r => r.durationMs);
+  const avgLatency = latencies.length > 0 ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) : 0;
+  const p95Latency = latencies.length > 0 ? latencies.sort((a, b) => a - b)[Math.floor(latencies.length * 0.95)] : 0;
+  const maxLatency = latencies.length > 0 ? Math.max(...latencies) : 0;
+
+  // Throughput
+  const rpm = last60s.length;
+  const bytesInPerSec = last60s.length > 0 ? Math.round(last60s.reduce((a, r) => a + r.bytesIn, 0) / 60) : 0;
+  const bytesOutPerSec = last60s.length > 0 ? Math.round(last60s.reduce((a, r) => a + r.bytesOut, 0) / 60) : 0;
+
+  // Error rate
+  const errors60s = last60s.filter(r => !r.ok).length;
+  const errorRate = last60s.length > 0 ? +(errors60s / last60s.length * 100).toFixed(1) : 0;
+
+  // Smoothness score (0-100, higher = smoother)
+  // Based on: latency (40%), error rate (30%), concurrency headroom (30%)
+  const maxAcceptableLatency = 5000; // 5s
+  const latencyScore = Math.max(0, 100 - (avgLatency / maxAcceptableLatency) * 100);
+  const errorScore = Math.max(0, 100 - errorRate * 5); // each 1% error = -5 points
+  const maxConcurrent = 50; // assume server can handle ~50 concurrent
+  const concurrencyScore = Math.max(0, 100 - (bandwidthStats.concurrentRequests / maxConcurrent) * 100);
+  const smoothness = Math.round(latencyScore * 0.4 + errorScore * 0.3 + concurrencyScore * 0.3);
+  const clampedSmoothness = Math.max(0, Math.min(100, smoothness));
+
+  let level, label;
+  if (clampedSmoothness >= 70) { level = "smooth"; label = "流畅"; }
+  else if (clampedSmoothness >= 40) { level = "moderate"; label = "适中"; }
+  else { level = "congested"; label = "拥堵"; }
+
+  return {
+    smoothness: clampedSmoothness,
+    level,
+    label,
+    concurrent: {
+      current: bandwidthStats.concurrentRequests,
+      peak: bandwidthStats.peakConcurrent,
+    },
+    latency: {
+      avg: avgLatency,
+      p95: p95Latency,
+      max: maxLatency,
+    },
+    throughput: {
+      rpm,
+      bytesInPerSec,
+      bytesOutPerSec,
+      mbInPerSec: +(bytesInPerSec / 1048576).toFixed(3),
+      mbOutPerSec: +(bytesOutPerSec / 1048576).toFixed(3),
+    },
+    errorRate,
+    totals: {
+      requests: bandwidthStats.totalRequests,
+      bytesIn: bandwidthStats.totalBytesIn,
+      bytesOut: bandwidthStats.totalBytesOut,
+      errors: bandwidthStats.totalErrors,
+      uptimeMin: Math.round((now - bandwidthStats.startedAt) / 60_000),
+    },
+    factors: {
+      latency: Math.round(latencyScore),
+      errorRate: Math.round(errorScore),
+      concurrency: Math.round(concurrencyScore),
+    },
+    recentTimeline: last5m.map(r => ({ ts: r.ts, ms: r.durationMs, ok: r.ok })),
+  };
+}
 
 const logsDir = path.join(PROJECT_ROOT, "logs");
 const logFile = path.join(logsDir, "events.jsonl");
@@ -840,6 +1164,25 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  if (req.method === "GET" && reqUrl.pathname === "/admin/bandwidth") {
+    const bw = getBandwidthMetrics();
+    // Attach affinity stats
+    const now = Date.now();
+    const activeBindings = [];
+    for (const [ip, entry] of sessionAffinityMap) {
+      if (entry.expiresAt > now) {
+        activeBindings.push({ ip, sessionId: entry.sessionId, expiresIn: Math.round((entry.expiresAt - now) / 1000) });
+      }
+    }
+    bw.affinity = {
+      activeBindings: activeBindings.length,
+      maxPerSession: MAX_USERS_PER_SESSION,
+      ttlMinutes: Math.round(SESSION_AFFINITY_TTL_MS / 60_000),
+      bindings: activeBindings,
+    };
+    return sendJson(res, 200, bw);
+  }
+
   if (req.method === "GET" && reqUrl.pathname === "/soc/events") {
     const limit = Math.min(Number(reqUrl.searchParams.get("limit") ?? 200), 1000);
     return sendJson(res, 200, { total: events.length, events: events.slice(-limit) });
@@ -949,8 +1292,28 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && reqUrl.pathname === "/v1/credits") {
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-    const authResult = userManager.authenticate(token);
 
+    // Try database auth first
+    const dbUser = getUserByApiKey(token);
+    if (dbUser) {
+      const sub = getActiveSubscription(dbUser.id);
+      return sendJson(res, 200, {
+        userId: dbUser.id,
+        name: dbUser.username,
+        credits: {
+          available: sub?.quota_remaining ?? 0,
+          limit: sub?.quota_total ?? 0,
+          plan: sub?.plan || "free",
+        },
+        recovery: {
+          amount: sub?.recovery_amount ?? 0,
+          intervalSeconds: sub?.recovery_interval ?? 0,
+        },
+      });
+    }
+
+    // Fallback to file-based userManager
+    const authResult = userManager.authenticate(token);
     if (!authResult) {
       return sendJson(res, 401, { error: { message: "unauthorized" } });
     }
@@ -980,7 +1343,38 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // ---- /v1/session-credits 端点（管理员查询 Trial 账号池 credits 状态） ----
+  if (req.method === "GET" && reqUrl.pathname === "/v1/session-credits") {
+    const sessions = sessionManager.getEnabledSessions();
+    const summary = sessions.map(s => {
+      const c = getSessionCredits(s.id);
+      return {
+        sessionId: s.id,
+        email: s.email || s.id,
+        credits: { remaining: Math.round(c.remaining * 100) / 100, total: c.total },
+        requests: c.requests,
+        lastModel: c.lastModel,
+        updatedAt: c.updatedAt ? new Date(c.updatedAt).toISOString() : null,
+        status: c.remaining <= 0 ? "depleted" : c.remaining <= TRIAL_LOW_CREDITS_THRESHOLD ? "low" : "ok",
+      };
+    });
+    const totalRemaining = summary.reduce((sum, s) => sum + s.credits.remaining, 0);
+    const depleted = summary.filter(s => s.status === "depleted").length;
+    return sendJson(res, 200, {
+      pool: { total: sessions.length, active: sessions.length - depleted, depleted },
+      totalCreditsRemaining: Math.round(totalRemaining),
+      sessions: summary,
+    });
+  }
+
   if (req.method === "POST" && reqUrl.pathname === "/v1/chat/completions") {
+    const bwTracker = bwTrackStart();
+    // Track response bytes
+    const origWrite = res.write.bind(res);
+    const origEnd = res.end.bind(res);
+    res.write = (chunk, ...args) => { if (chunk) bwTracker.bytesOut += Buffer.byteLength(chunk); return origWrite(chunk, ...args); };
+    res.end = (chunk, ...args) => { if (chunk) bwTracker.bytesOut += Buffer.byteLength(chunk); const r = origEnd(chunk, ...args); bwTrackEnd(bwTracker, res.statusCode); return r; };
+
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
     const tokenHash = hashToken(token);
@@ -993,29 +1387,30 @@ const server = http.createServer(async (req, res) => {
       tokenHash,
     };
 
-    const authResult = userManager.authenticate(token);
-    if (!authResult) {
-      recordEvent({ ...baseEvent, status: 401, reason: "invalid_token" });
-      return sendJson(res, 401, { error: { message: "unauthorized" } });
+    // Try database auth first, fallback to file-based userManager
+    const dbUser = getUserByApiKey(token);
+    let user, userState, authResult, useDbAuth = false;
+
+    if (dbUser) {
+      useDbAuth = true;
+      user = { id: dbUser.id, name: dbUser.username };
+      userState = {};
+    } else {
+      authResult = userManager.authenticate(token);
+      if (!authResult) {
+        recordEvent({ ...baseEvent, status: 401, reason: "invalid_token" });
+        return sendJson(res, 401, { error: { message: "unauthorized" } });
+      }
+      user = authResult.config;
+      userState = authResult.state;
     }
-    const user = authResult.config;
-    const userState = authResult.state;
 
     if (currentMinuteCount(token) >= MAX_RPM_PER_TOKEN) {
       recordEvent({ ...baseEvent, status: 429, reason: "rate_limited", user: user.name });
       return sendJson(res, 429, { error: { message: "rate limit exceeded" } });
     }
 
-    // 检查积分余额
-    const availableCredits = userManager.getAvailableCredits(user.id);
-    if (availableCredits <= 0) {
-      recordEvent({ ...baseEvent, status: 429, reason: "credits_exhausted", user: user.name });
-      return sendJson(res, 429, {
-        error: { message: "credits exhausted, will recover automatically" },
-        credits: { available: 0, limit: user.creditLimit, nextRecoveryIn: "~" + Math.round(user.creditRecoveryIntervalMs / 60_000) + "min" },
-      });
-    }
-
+    // 先解析 body 确定模型，再按模型积分扣减
     let body;
     try {
       body = await parseJsonBody(req);
@@ -1025,6 +1420,31 @@ const server = http.createServer(async (req, res) => {
     }
 
     const model = typeof body?.model === "string" ? body.model : "lab-model";
+    const creditCost = getModelCredits(model);
+
+    // 检查积分余额 & 扣减（按模型 Windsurf credits 扣）
+    if (creditCost > 0) {
+      if (useDbAuth) {
+        const creditResult = deductCredit(dbUser.id, creditCost);
+        if (!creditResult.ok) {
+          recordEvent({ ...baseEvent, status: 429, reason: creditResult.reason, user: user.name, model, creditCost });
+          return sendJson(res, 429, {
+            error: { message: creditResult.reason === "no_subscription" ? "no active subscription" : "credits exhausted, will recover automatically" },
+            credits: { available: 0, remaining: 0 },
+          });
+        }
+      } else {
+        const availableCredits = userManager.getAvailableCredits(user.id);
+        if (availableCredits < creditCost) {
+          recordEvent({ ...baseEvent, status: 429, reason: "credits_exhausted", user: user.name, model, creditCost });
+          return sendJson(res, 429, {
+            error: { message: "credits exhausted, will recover automatically" },
+            credits: { available: availableCredits, limit: user.creditLimit, nextRecoveryIn: "~" + Math.round(user.creditRecoveryIntervalMs / 60_000) + "min" },
+          });
+        }
+        userManager.consumeCredits(user.id, creditCost);
+      }
+    }
     const messages = Array.isArray(body?.messages) ? body.messages : [];
     if (messages.length === 0) {
       recordEvent({ ...baseEvent, status: 400, reason: "messages_required", user: user.name });
@@ -1094,7 +1514,6 @@ const server = http.createServer(async (req, res) => {
           res.end();
 
           const streamTokenEstimate = promptTokens + 50;
-          userManager.consumeCredits(user.id, streamTokenEstimate);
           sessionManager.recordUsage(platformSession.id, streamTokenEstimate);
 
           recordEvent({
@@ -1105,6 +1524,7 @@ const server = http.createServer(async (req, res) => {
             sessionId: platformSession.id,
             platform: platformSession.platform,
             mode: "platform_stream",
+            creditCost,
             promptTokens,
             totalTokens: streamTokenEstimate,
             tags,
@@ -1124,7 +1544,6 @@ const server = http.createServer(async (req, res) => {
         const result = adapter.fromPlatform(platformData, { model, requestId });
         const totalTokens = result?.usage?.total_tokens ?? promptTokens + 50;
 
-        userManager.consumeCredits(user.id, totalTokens);
         sessionManager.recordUsage(platformSession.id, totalTokens);
 
         result.lab_meta = {
@@ -1142,6 +1561,7 @@ const server = http.createServer(async (req, res) => {
           sessionId: platformSession.id,
           platform: platformSession.platform,
           mode: "platform",
+          creditCost,
           promptTokens,
           totalTokens,
           tags,
@@ -1159,6 +1579,7 @@ const server = http.createServer(async (req, res) => {
           sessionId: platformSession.id,
           platform: platformSession.platform,
           mode: "platform",
+          creditCost,
           tags,
         });
         return sendJson(res, 502, {
@@ -1174,7 +1595,6 @@ const server = http.createServer(async (req, res) => {
         if (wantsStream) {
           await forwardStreamToClient(account, body, res);
           const streamTokenEstimate = promptTokens + 50;
-          userManager.consumeCredits(user.id, streamTokenEstimate);
           account.usedTokens += streamTokenEstimate;
           if (account.usedTokens >= account.dailyLimit) {
             account.enabled = false;
@@ -1187,6 +1607,7 @@ const server = http.createServer(async (req, res) => {
             model,
             accountId: account.id,
             mode: "upstream_stream",
+            creditCost,
             promptTokens,
             totalTokens: streamTokenEstimate,
             tags,
@@ -1196,7 +1617,6 @@ const server = http.createServer(async (req, res) => {
 
         const upstreamResult = await forwardToUpstream(account, body);
         const totalTokens = upstreamResult?.usage?.total_tokens ?? promptTokens + 50;
-        userManager.consumeCredits(user.id, totalTokens);
         account.usedTokens += totalTokens;
         if (account.usedTokens >= account.dailyLimit) {
           account.enabled = false;
@@ -1216,6 +1636,7 @@ const server = http.createServer(async (req, res) => {
           model,
           accountId: account.id,
           mode: "upstream",
+          creditCost,
           promptTokens,
           completionTokens: upstreamResult?.usage?.completion_tokens ?? 0,
           totalTokens,
@@ -1245,10 +1666,7 @@ const server = http.createServer(async (req, res) => {
     const completionTokens = estimateTokens(completionText);
     const totalTokens = promptTokens + completionTokens;
 
-    if (!userManager.consumeCredits(user.id, totalTokens)) {
-      recordEvent({ ...baseEvent, status: 429, reason: "credits_exhausted", user: user.name });
-      return sendJson(res, 429, { error: { message: "credits exhausted" } });
-    }
+    // 积分已在请求入口按模型扣减，此处不再重复扣
     account.usedTokens += totalTokens;
     if (account.usedTokens >= account.dailyLimit) {
       account.enabled = false;
@@ -1289,6 +1707,7 @@ const server = http.createServer(async (req, res) => {
       model,
       accountId: account.id,
       mode: "simulate",
+      creditCost,
       promptTokens,
       completionTokens,
       totalTokens,
@@ -1298,18 +1717,47 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, payload);
   }
 
+  // ---- Client Diagnostic Report (Go EXE 远程回报) ----
+  if (req.method === "POST" && reqUrl.pathname === "/api/client/report") {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const report = JSON.parse(Buffer.concat(chunks).toString());
+        console.log(`[client-report] ip=${clientIp} version=${report.version} proxy=${report.proxy_running} port443=${report.port_443} hosts=${report.hosts_ok} cert=${report.cert_ok} gateway=${report.gateway_ok} error=${report.error || "none"}`);
+        recordEvent({
+          timestamp: new Date().toISOString(),
+          ip: clientIp,
+          type: "client_diagnostic",
+          ...report,
+        });
+        sendJson(res, 200, { ok: true, message: "report received" });
+      } catch (e) {
+        sendJson(res, 400, { error: { message: "invalid report" } });
+      }
+    });
+    return;
+  }
+
   // ---- Raw Connect Protocol Proxy (Windsurf MITM) ----
   // Catches all /exa.* paths forwarded by local-proxy in gateway mode.
   // Picks a session, replaces credentials, forwards to real Windsurf.
   if (req.method === "POST" && reqUrl.pathname.startsWith("/exa.")) {
+    const bwTracker = bwTrackStart();
+    const origWrite2 = res.write.bind(res);
+    const origEnd2 = res.end.bind(res);
+    res.write = (chunk, ...args) => { if (chunk) bwTracker.bytesOut += Buffer.byteLength(chunk); return origWrite2(chunk, ...args); };
+    res.end = (chunk, ...args) => { if (chunk) bwTracker.bytesOut += Buffer.byteLength(chunk); const r = origEnd2(chunk, ...args); bwTrackEnd(bwTracker, res.statusCode); return r; };
+
     const bodyChunks = [];
     req.on("data", (c) => bodyChunks.push(c));
     req.on("end", async () => {
       const body = Buffer.concat(bodyChunks);
+      bwTracker.bytesIn = body.length;
       const startTime = Date.now();
 
-      // Pick a session from the pool
-      const session = sessionManager.pickSession();
+      // Pick a session with affinity (same IP → same session)
+      const session = getAffinitySession(clientIp);
       if (!session) {
         recordEvent({
           timestamp: new Date().toISOString(),
@@ -1363,9 +1811,41 @@ const server = http.createServer(async (req, res) => {
 
             console.log(`[windsurf-proxy] ${reqUrl.pathname} -> ${upstreamRes.statusCode} (${durationMs}ms, session=${session.id})`);
 
+            // DEBUG: log response content for status/profile calls to check account tier
+            if (reqUrl.pathname.includes("GetUserStatus") || reqUrl.pathname.includes("GetProfileData")) {
+              try {
+                const zlib = require("zlib");
+                let readable = "";
+                if (resBody.length > 5) {
+                  const flags = resBody[0];
+                  const frameLen = resBody.readUInt32BE(1);
+                  const payload = resBody.slice(5, 5 + frameLen);
+                  const raw = (flags & 0x01) ? zlib.gunzipSync(payload) : payload;
+                  readable = raw.toString("utf8").replace(/[^\x20-\x7E]/g, "|");
+                }
+                console.log(`[DEBUG-TIER] ${reqUrl.pathname} session=${session.id}: ${readable.substring(0, 500)}`);
+              } catch (e) { console.log(`[DEBUG-TIER] parse error: ${e.message}`); }
+            }
+
             // Estimate token usage for accounting
             const tokenEstimate = Math.max(1, Math.ceil(body.length / 50));
             sessionManager.recordUsage(session.id, tokenEstimate);
+
+            // ---- Credit tracking: deduct Trial credits on GetChatMessage ----
+            const epName = reqUrl.pathname.split("/").pop();
+            let creditInfo = null;
+            if (epName === "GetChatMessage" && upstreamRes.statusCode === 200) {
+              const model = extractModelFromWindsurfResponse(resBody);
+              creditInfo = deductSessionCredits(session.id, model);
+              console.log(`[credit-track] session=${session.id} model=${creditInfo.model || "?"} cost=${creditInfo.cost} credits=${Math.round(creditInfo.after)}/${TRIAL_INITIAL_CREDITS}`);
+
+              if (creditInfo.after <= 0) {
+                const evicted = evictSessionAffinity(session.id);
+                console.log(`[credit-track] session=${session.id} DEPLETED after ${creditInfo.before > 0 ? "this request" : "previous"}, evicted ${evicted} affinity bindings`);
+              } else if (creditInfo.after <= TRIAL_LOW_CREDITS_THRESHOLD) {
+                console.log(`[credit-track] session=${session.id} LOW credits warning: ${Math.round(creditInfo.after)} remaining`);
+              }
+            }
 
             recordEvent({
               timestamp: new Date().toISOString(),
@@ -1376,6 +1856,7 @@ const server = http.createServer(async (req, res) => {
               sessionId: session.id,
               mode: "windsurf_proxy",
               durationMs,
+              ...(creditInfo ? { creditCost: creditInfo.cost, creditsRemaining: Math.round(creditInfo.after), model: creditInfo.model } : {}),
             });
 
             // Forward response headers and body

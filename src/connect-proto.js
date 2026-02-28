@@ -325,31 +325,52 @@ function replaceMetaCredentials(metaBytes, newApiKey, newJwtToken) {
 }
 
 /**
- * Replace credentials in a Connect protocol frame buffer.
+ * Replace credentials in a Connect protocol frame buffer OR raw protobuf.
  * Swaps field 1.3 (api_key) and field 1.21 (jwtToken) in the protobuf.
- * @param {Buffer} frameBuffer - Full Connect frame (5-byte header + payload)
+ * Supports both Connect frame (5-byte header + payload) and raw protobuf
+ * (e.g. GetUserStatus uses application/proto with no frame header).
+ * @param {Buffer} frameBuffer - Connect frame or raw protobuf
  * @param {string} newApiKey - New api_key to inject
  * @param {string|null} newJwtToken - New JWT token, or null to strip
- * @returns {Buffer} New Connect frame with replaced credentials
+ * @returns {Buffer} Modified buffer with replaced credentials
  */
 export function replaceConnectCredentials(frameBuffer, newApiKey, newJwtToken) {
-  if (!frameBuffer || frameBuffer.length < 5) return frameBuffer;
+  if (!frameBuffer || frameBuffer.length < 2) return frameBuffer;
 
-  const flags = frameBuffer[0];
-  const frameLen = frameBuffer.readUInt32BE(1);
-  if (5 + frameLen > frameBuffer.length) return frameBuffer;
-  const payload = frameBuffer.subarray(5, 5 + frameLen);
-  const isCompressed = !!(flags & 0x01);
+  // Detect format: Connect frame starts with flags 0x00 (uncompressed) or 0x01 (gzip)
+  // Raw protobuf starts with a field tag (e.g. 0x0a = field 1, wire type 2)
+  const firstByte = frameBuffer[0];
+  const isConnectFrame = (firstByte === 0x00 || firstByte === 0x01) &&
+    frameBuffer.length >= 5 &&
+    (5 + frameBuffer.readUInt32BE(1)) <= frameBuffer.length;
 
-  let protobufData;
-  try {
-    protobufData = isCompressed ? zlib.gunzipSync(payload) : payload;
-  } catch {
-    return frameBuffer;
+  if (isConnectFrame) {
+    // ---- Connect frame format ----
+    const flags = firstByte;
+    const frameLen = frameBuffer.readUInt32BE(1);
+    const payload = frameBuffer.subarray(5, 5 + frameLen);
+    const isCompressed = !!(flags & 0x01);
+
+    let protobufData;
+    try {
+      protobufData = isCompressed ? zlib.gunzipSync(payload) : payload;
+    } catch {
+      return frameBuffer;
+    }
+
+    const newProtobuf = _replaceCredentialsInProtobuf(protobufData, newApiKey, newJwtToken);
+    if (!newProtobuf) return frameBuffer;
+    return encodeConnectFrame(newProtobuf, isCompressed);
+  } else {
+    // ---- Raw protobuf format (e.g. application/proto) ----
+    const newProtobuf = _replaceCredentialsInProtobuf(frameBuffer, newApiKey, newJwtToken);
+    return newProtobuf || frameBuffer;
   }
+}
 
+function _replaceCredentialsInProtobuf(protobufData, newApiKey, newJwtToken) {
   const outerFields = parseRawFields(protobufData);
-  if (outerFields.length === 0) return frameBuffer;
+  if (outerFields.length === 0) return null;
 
   const parts = [];
   for (const f of outerFields) {
@@ -364,8 +385,7 @@ export function replaceConnectCredentials(frameBuffer, newApiKey, newJwtToken) {
     }
   }
 
-  const newProtobuf = Buffer.concat(parts);
-  return encodeConnectFrame(newProtobuf, isCompressed);
+  return Buffer.concat(parts);
 }
 
 export function extractStreamDelta(frameData) {
