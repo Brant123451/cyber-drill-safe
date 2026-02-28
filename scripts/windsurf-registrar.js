@@ -6614,27 +6614,39 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
 
   console.log(`${prefix}   页面状态: ${(pageCheck.text || "").substring(0, 200)}`);
 
-  // 关闭 Cookie 弹窗（如果有）
+  // 关闭 Cookie 弹窗（如果有）—— 仅匹配 cookie/consent 相关弹窗
   await page.evaluate(() => {
-    const cookieBtn = [...document.querySelectorAll("button")].find(b =>
-      /accept all|accept/i.test((b.textContent || "").trim()) && b.offsetParent !== null
-    );
-    if (cookieBtn) cookieBtn.click();
+    const cookieBtns = [...document.querySelectorAll("button")].filter(b => {
+      const t = (b.textContent || "").trim().toLowerCase();
+      // 必须是 cookie/consent 弹窗的按钮
+      const parent = b.closest('[class*="cookie"], [class*="consent"], [class*="banner"], [id*="cookie"], [id*="consent"]');
+      return (t === "accept all" || t === "accept" || t === "got it" || t === "ok") &&
+        b.offsetParent !== null && (parent || t === "accept all");
+    });
+    for (const btn of cookieBtns) btn.click();
   });
   await new Promise(r => setTimeout(r, 1000));
 
-  // 点击 "Start Pro Trial" / "Accept" / "Get Started" / "Claim" 按钮
+  // 点击 "Accept referral" / "Start Pro Trial" / "Get Started" / "Claim" 按钮
   console.log(`${prefix} → 点击接受推荐按钮...`);
   const clickResult = await page.evaluate(() => {
     const allEls = [...document.querySelectorAll("button, a, [role='button'], [class*='button'], [class*='btn'], [class*='cta']")];
+    // 排除 cookie/consent 弹窗元素
+    const filtered = allEls.filter(e => {
+      const t = (e.textContent || "").toLowerCase().trim();
+      if (t.includes("reject") || t.includes("manage") || t.includes("preferences") || t.includes("cookie")) return false;
+      if (t === "accept all") return false; // cookie banner
+      return e.offsetParent !== null && !e.disabled;
+    });
     const priorities = [
-      "claim", "accept", "get started", "start free trial", "start trial",
+      "accept referral", "claim", "accept",
+      "get started", "start free trial", "start trial",
       "select plan", "try pro", "upgrade", "continue", "start",
     ];
     for (const keyword of priorities) {
-      const el = allEls.find(e => {
+      const el = filtered.find(e => {
         const t = (e.textContent || "").toLowerCase().trim();
-        return t.includes(keyword) && e.offsetParent !== null && !e.disabled;
+        return t.includes(keyword);
       });
       if (el) {
         if (el.href) location.href = el.href;
