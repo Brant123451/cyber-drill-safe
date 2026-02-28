@@ -6694,37 +6694,22 @@ async function acceptReferralOnPage(page, referralCode, vcc, screenshotDir) {
 
     if (viewPlansClicked) {
       console.log(`${prefix}   ✓ 点击: "${viewPlansClicked}"`);
-      await new Promise(r => setTimeout(r, 5000));
-      // View plans 可能跳到 pricing 页面，需要再点 "Start free trial"
+      await new Promise(r => setTimeout(r, 3000));
       const pricingUrl = page.url();
       console.log(`${prefix}   URL: ${pricingUrl}`);
+
+      // 到了 pricing 页面 → 直接复用 activateProTrialOnPage 的完整流程
       if (pricingUrl.includes("pricing") || pricingUrl.includes("windsurf.com")) {
-        const startTrialClicked = await page.evaluate(() => {
-          const btns = [...document.querySelectorAll("button, a")];
-          const keywords = ["start free trial", "start trial", "try pro", "subscribe", "get started"];
-          for (const kw of keywords) {
-            const btn = btns.find(b => {
-              const t = (b.textContent || "").toLowerCase().trim();
-              return t.includes(kw) && b.offsetParent !== null;
-            });
-            if (btn) {
-              if (btn.href) location.href = btn.href;
-              else btn.click();
-              return (btn.textContent || "").trim().substring(0, 40);
-            }
-          }
-          return null;
-        });
-        if (startTrialClicked) {
-          console.log(`${prefix}   ✓ 点击 pricing: "${startTrialClicked}"`);
-          await new Promise(r => setTimeout(r, 5000));
-        }
+        console.log(`${prefix}   → 进入 pricing 页面，调用 activateProTrialOnPage 处理...`);
+        page._trialEmail = page._trialEmail || ""; // 确保邮件确认可用
+        return await activateProTrialOnPage(page, vcc, screenshotDir);
       }
     } else {
       console.log(`${prefix}   ⚠ 未找到 View plans 按钮`);
     }
   }
 
+  // 如果没进 pricing 页面，走原有的 Stripe 检测逻辑
   // 等待 Turnstile（如果有）
   console.log(`${prefix} → 等待 Turnstile CAPTCHA...`);
   for (let i = 0; i < 15; i++) {
