@@ -6844,38 +6844,49 @@ async function referralFlow(referrerAccount, vcc, options = {}) {
     await browser1.close().catch(() => {});
   }
 
-  // ── Phase 2: 注册新 Free 账号（如果没有指定跳过） ──
+  // ── Phase 2: 从 free 池选取已注册账号 ──
   let newAccount;
-  if (skipRegister && newAccountEmail) {
-    // 使用已有账号
+  if (newAccountEmail) {
+    // 指定了新账号邮箱
     const data = loadAccounts();
     newAccount = data.accounts.find(a => a.email === newAccountEmail);
     if (!newAccount) {
       console.log(`${prefix} ✗ 未找到账号: ${newAccountEmail}`);
       return { success: false, error: "account_not_found" };
     }
-    console.log(`\n${prefix} ══ Phase 2: 使用已有账号 ${newAccount.email} ══`);
+    console.log(`\n${prefix} ══ Phase 2: 使用指定账号 ${newAccount.email} ══`);
   } else {
-    console.log(`\n${prefix} ══ Phase 2: 注册新 Free 账号 ══`);
-    const identity = await generateIdentity(false);
-    console.log(`${prefix}   新邮箱: ${identity.email}`);
+    // 从 free 池中随机选取一个 registered 账号（排除推荐人自己）
+    const data = loadAccounts();
+    const freePool = data.accounts.filter(a =>
+      a.status === "registered" && a.apiKey && a.email !== referrerAccount.email
+    );
+    if (freePool.length > 0) {
+      newAccount = freePool[Math.floor(Math.random() * freePool.length)];
+      console.log(`\n${prefix} ══ Phase 2: 从 free 池选取 ${newAccount.email} (池中 ${freePool.length} 个可用) ══`);
+    } else {
+      // free 池为空，才注册新账号
+      console.log(`\n${prefix} ══ Phase 2: free 池为空，注册新账号 ══`);
+      const identity = await generateIdentity(true);
+      console.log(`${prefix}   新邮箱: ${identity.email}`);
 
-    let regResult;
-    try {
-      regResult = await registerViaCodeium(identity, { headless: !options.headful });
-    } catch (err) {
-      console.log(`${prefix}   ✗ 注册失败: ${err.message}`);
-      return { success: false, error: "registration_failed", referralCode };
+      let regResult;
+      try {
+        regResult = await registerViaCodeium(identity, { headless: !options.headful });
+      } catch (err) {
+        console.log(`${prefix}   ✗ 注册失败: ${err.message}`);
+        return { success: false, error: "registration_failed", referralCode };
+      }
+
+      if (!regResult || regResult.status === "pending_verification") {
+        console.log(`${prefix}   ✗ 注册未完成`);
+        return { success: false, error: "registration_incomplete", referralCode };
+      }
+
+      await addAccount(regResult);
+      console.log(`${prefix}   ✓ 注册成功: ${regResult.email}`);
+      newAccount = regResult;
     }
-
-    if (!regResult || regResult.status === "pending_verification") {
-      console.log(`${prefix}   ✗ 注册未完成`);
-      return { success: false, error: "registration_incomplete", referralCode };
-    }
-
-    await addAccount(regResult);
-    console.log(`${prefix}   ✓ 注册成功: ${regResult.email}`);
-    newAccount = regResult;
   }
 
   await new Promise(r => setTimeout(r, 5000)); // 等账号稳定
